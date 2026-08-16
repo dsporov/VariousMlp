@@ -29,6 +29,8 @@
 #include <utility>
 #include <vector>
 
+#include "check.h"
+
 namespace {
 
 // ---------------------------------------------------------------------------
@@ -39,8 +41,20 @@ constexpr int kVocab = 27;   // '.' plus the 26 lowercase letters
 
 // The video's stoi / itos dicts. A contiguous alphabet means we can just do
 // arithmetic instead of building the maps.
-inline int  encode(char c) { return c == '.' ? 0 : c - 'a' + 1; }
-inline char decode(int i) { return i == 0 ? '.' : static_cast<char>('a' + i - 1); }
+// Anything outside '.' and a-z lands outside [0, kVocab) and indexes off the
+// end of the 27x27 arrays, so it is worth a compare per character. load_names
+// filters the dataset up front; this is the backstop for hand-written probes.
+inline int encode(char c) {
+    CHECK(c == '.' || (c >= 'a' && c <= 'z'),
+        "expected '.' or a-z, got '" << c << "' (byte "
+        << static_cast<int>(static_cast<unsigned char>(c)) << ")");
+    return c == '.' ? 0 : c - 'a' + 1;
+}
+
+inline char decode(int i) {
+    CHECK(i >= 0 && i < kVocab, "token " << i << " is outside the vocabulary");
+    return i == 0 ? '.' : static_cast<char>('a' + i - 1);
+}
 
 std::vector<std::string> load_names() {
     // Relative to a few plausible working directories: Visual Studio runs with
@@ -59,12 +73,21 @@ std::vector<std::string> load_names() {
 
         std::vector<std::string> words;
         std::string line;
+        size_t skipped = 0;
         while (std::getline(f, line)) {
             if (!line.empty() && line.back() == '\r') line.pop_back();  // CRLF
-            if (!line.empty()) words.push_back(line);
+            if (line.empty()) continue;
+            // The model has exactly 27 tokens, so a stray uppercase letter,
+            // digit or accent has nowhere to go. Drop those lines here rather
+            // than letting encode() abort the whole run over one bad name.
+            const bool clean = std::all_of(line.begin(), line.end(),
+                [](char c) { return c >= 'a' && c <= 'z'; });
+            if (clean) words.push_back(line);
+            else ++skipped;
         }
         if (!words.empty()) {
             printf("  loaded %zu names from %s\n", words.size(), path);
+            if (skipped) printf("  skipped %zu line(s) with characters outside a-z\n", skipped);
             return words;
         }
     }
@@ -97,6 +120,11 @@ std::vector<int> count_bigrams(const std::vector<std::string>& words) {
 }
 
 void print_top_bigrams(const std::vector<int>& N, int k) {
+    CHECK(N.size() == kVocab * kVocab, "expected a " << kVocab << "x" << kVocab
+        << " count matrix, got " << N.size() << " entries");
+    CHECK(k > 0 && k <= static_cast<int>(N.size()),
+        "asked for the top " << k << " of " << N.size() << " bigrams");
+
     std::vector<std::pair<int, int>> flat;         // (count, flat index)
     flat.reserve(N.size());
     for (int i = 0; i < static_cast<int>(N.size()); ++i) flat.emplace_back(N[i], i);
@@ -121,15 +149,38 @@ void print_count_matrix(const std::vector<int>& N) {
     }
 }
 
+// The postcondition for anything claiming to produce a distribution. 27x27
+// adds, run once per matrix, and it is the check that catches a normalisation
+// written the wrong way round - which otherwise just looks like a bad model.
+void check_rows_sum_to_one(const std::vector<double>& P, const char* what) {
+    CHECK(P.size() == kVocab * kVocab, what << ": expected a " << kVocab << "x"
+        << kVocab << " matrix, got " << P.size() << " entries");
+    for (int i = 0; i < kVocab; ++i) {
+        double sum = 0.0;
+        for (int j = 0; j < kVocab; ++j) sum += P[i * kVocab + j];
+        CHECK(std::fabs(sum - 1.0) < 1e-12,
+            what << ": row '" << decode(i) << "' sums to " << sum << ", not 1");
+    }
+}
+
 // P = (N + smoothing) normalised per row. smoothing=0 is the raw model,
 // smoothing=1 is the video's "model smoothing" that kills the infinities.
 std::vector<double> row_normalise(const std::vector<int>& N, double smoothing) {
+    CHECK(N.size() == kVocab * kVocab, "expected a " << kVocab << "x" << kVocab
+        << " count matrix, got " << N.size() << " entries");
+    CHECK(smoothing >= 0.0, "negative smoothing (" << smoothing << ") makes negative probabilities");
+
     std::vector<double> P(N.size());
     for (int i = 0; i < kVocab; ++i) {
         double sum = 0.0;
         for (int j = 0; j < kVocab; ++j) sum += N[i * kVocab + j] + smoothing;
+        // A character that never starts a bigram leaves an all-zero row, and
+        // 0/0 would quietly fill it with NaN.
+        CHECK(sum > 0.0, "no counts in the row for '" << decode(i)
+            << "'; pass smoothing > 0 to make it a valid distribution");
         for (int j = 0; j < kVocab; ++j) P[i * kVocab + j] = (N[i * kVocab + j] + smoothing) / sum;
     }
+    check_rows_sum_to_one(P, "normalised counts");
     return P;
 }
 
@@ -140,14 +191,28 @@ std::vector<double> row_normalise(const std::vector<int>& N, double smoothing) {
 // torch.multinomial on one row. discrete_distribution normalises internally,
 // so the row's weights can be counts or probabilities.
 std::string sample_name(const std::vector<double>& P, std::mt19937& g) {
+    CHECK(P.size() == kVocab * kVocab, "expected a " << kVocab << "x" << kVocab
+        << " probability matrix, got " << P.size() << " entries");
+
+    // A model that never emits the end token would loop forever. The uniform
+    // model in the walkthrough already produces 26-character names on average,
+    // so the cap has to be generous to only ever mean "something is broken".
+    constexpr size_t kMaxLength = 1000;
+
     std::string out;
     int ix = 0;                                    // always start at '.'
     for (;;) {
         const double* row = &P[ix * kVocab];
+        double sum = 0.0;
+        for (int j = 0; j < kVocab; ++j) sum += row[j];
+        CHECK(sum > 0.0, "row '" << decode(ix) << "' has no probability mass to sample from");
+
         std::discrete_distribution<int> dist(row, row + kVocab);
         ix = dist(g);
         if (ix == 0) break;                        // sampled the end token
         out.push_back(decode(ix));
+        CHECK(out.size() < kMaxLength,
+            "sampling ran past " << kMaxLength << " characters without an end token");
     }
     return out;
 }
@@ -159,6 +224,10 @@ std::string sample_name(const std::vector<double>& P, std::mt19937& g) {
 double average_nll(const std::vector<std::string>& words,
     const std::vector<double>& P,
     long long* bigrams_out = nullptr) {
+    CHECK(!words.empty(), "no words to score");
+    CHECK(P.size() == kVocab * kVocab, "expected a " << kVocab << "x" << kVocab
+        << " probability matrix, got " << P.size() << " entries");
+
     double log_likelihood = 0.0;
     long long n = 0;
     for (const auto& w : words) {
@@ -167,6 +236,11 @@ double average_nll(const std::vector<std::string>& words,
             ++n;
             });
     }
+    // Every word contributes at least one bigram, so n == 0 would mean the
+    // padding in for_each_bigram stopped working. (An unseen bigram still gives
+    // -inf here on purpose: that is the point the walkthrough makes with
+    // 'andrejq' before it introduces smoothing.)
+    CHECK(n > 0, "scored " << words.size() << " words but counted no bigrams");
     if (bigrams_out) *bigrams_out = n;
     return -log_likelihood / static_cast<double>(n);
 }
@@ -174,6 +248,19 @@ double average_nll(const std::vector<std::string>& words,
 // ---------------------------------------------------------------------------
 // 4. The same model as a neural net
 // ---------------------------------------------------------------------------
+
+// Every index here becomes raw pointer arithmetic into W below, so a bad one is
+// an out-of-bounds write rather than a wrong answer. One pass over the dataset,
+// before training starts; the training loop itself stays check-free.
+void validate_examples(const std::vector<int>& xs, const std::vector<int>& ys) {
+    CHECK(!xs.empty(), "no training examples");
+    CHECK(xs.size() == ys.size(),
+        xs.size() << " inputs but " << ys.size() << " targets");
+    for (size_t i = 0; i < xs.size(); ++i)
+        CHECK(xs[i] >= 0 && xs[i] < kVocab && ys[i] >= 0 && ys[i] < kVocab,
+            "example " << i << " is (" << xs[i] << ", " << ys[i]
+            << "), outside [0, " << kVocab << ")");
+}
 
 void train_neural_net(const std::vector<std::string>& words, double count_model_loss) {
     // The training set: one example per bigram.
@@ -184,11 +271,15 @@ void train_neural_net(const std::vector<std::string>& words, double count_model_
     const size_t num = xs.size();
     printf("  %zu bigram examples\n", num);
 
+    validate_examples(xs, ys);
+
     // W = torch.randn((27, 27), requires_grad=True)
     std::mt19937 g(2147483647);
     std::normal_distribution<double> randn(0.0, 1.0);
     std::vector<double> W(kVocab * kVocab);
     for (auto& w : W) w = randn(g);
+
+    double first_loss = 0.0, last_loss = 0.0;
 
     std::vector<double> dW(kVocab * kVocab);
     const double inv_n = 1.0 / static_cast<double>(num);
@@ -244,6 +335,9 @@ void train_neural_net(const std::vector<std::string>& words, double count_model_
 
         for (int k = 0; k < kVocab * kVocab; ++k) W[k] -= lr * dW[k];
 
+        if (step == 0) first_loss = loss;
+        last_loss = loss;
+
         if (step % 10 == 0 || step == steps - 1)
             printf("    step %3d  loss %.6f (incl. regularisation)\n", step, loss);
     }
@@ -260,13 +354,25 @@ void train_neural_net(const std::vector<std::string>& words, double count_model_
         for (int j = 0; j < kVocab; ++j) { P[i * kVocab + j] = std::exp(row[j] - maxl); denom += P[i * kVocab + j]; }
         for (int j = 0; j < kVocab; ++j) P[i * kVocab + j] /= denom;
     }
+    check_rows_sum_to_one(P, "softmax of W");
 
     // Like-for-like: both numbers below are the plain nll with no regularisation
     // term. The net sits a little above the count model because the L2 pull is
     // still smoothing it - drop reg to 0 and the two converge.
     long long n = 0;
+    const double net_loss = average_nll(words, P, &n);
     printf("  count model loss %.6f  vs  neural net loss %.6f\n",
-        count_model_loss, average_nll(words, P, &n));
+        count_model_loss, net_loss);
+
+    // The claim the whole file is built to demonstrate, checked instead of
+    // asserted in a comment: gradient descent rediscovered the counts. reg =
+    // 0.01 leaves the net about 0.021 nats above the count model after 100
+    // steps, so the tolerance sits just above that - raise reg, or stop
+    // training early, and this is the line that notices.
+    sanity::Expect chk;
+    chk.that("training loss went down", last_loss < first_loss);
+    chk.close("net matches the count model", net_loss, count_model_loss, 0.03);
+    chk.report();
 
     std::mt19937 gs(2147483647);
     printf("  samples from the trained net: ");
@@ -295,13 +401,35 @@ void test_makemore() {
         longest = std::max(longest, w.size());
     }
     std::cout << "  first 8: ";
-    for (int i = 0; i < 8; ++i) std::cout << words[i] << " ";
-    printf("\n  lengths %zu..%zu   (expected 32033 names, 2..15)\n\n", shortest, longest);
+    for (size_t i = 0; i < std::min<size_t>(8, words.size()); ++i) std::cout << words[i] << " ";
+    printf("\n  lengths %zu..%zu\n", shortest, longest);
+
+    // Everything below is checked against the video, which means checked
+    // against its dataset. Swap names.txt for another list and these are
+    // expected to fail - hence Expect, which reports and carries on, rather
+    // than CHECK, which would stop the walkthrough.
+    sanity::Expect data;
+    data.equal("names loaded", static_cast<double>(words.size()), 32033);
+    data.equal("shortest name", static_cast<double>(shortest), 2);
+    data.equal("longest name", static_cast<double>(longest), 15);
+    data.report();
+    std::cout << "\n";
 
     std::cout << "== 1. counting bigrams ==\n";
     const std::vector<int> N = count_bigrams(words);
     print_top_bigrams(N, 10);
-    std::cout << "  (expected n. 6763, a. 6640, an 5438, .a 4410, ...)\n";
+
+    // The counting step is the foundation for both models, so pin the four
+    // counts the video reads out loud plus the total.
+    long long total = 0;
+    for (int c : N) total += c;
+    sanity::Expect counts;
+    counts.equal("n. count", N[encode('n') * kVocab + encode('.')], 6763);
+    counts.equal("a. count", N[encode('a') * kVocab + encode('.')], 6640);
+    counts.equal("an count", N[encode('a') * kVocab + encode('n')], 5438);
+    counts.equal(".a count", N[encode('.') * kVocab + encode('a')], 4410);
+    counts.equal("total bigrams", static_cast<double>(total), 228146);
+    counts.report();
     print_count_matrix(N);
     std::cout << "\n";
 
@@ -327,6 +455,11 @@ void test_makemore() {
     long long n = 0;
     const double nll = average_nll(words, P, &n);
     printf("  %lld bigrams, average nll %.4f nats   (video: 228146 bigrams, ~2.454)\n", n, nll);
+
+    sanity::Expect loss;
+    loss.equal("bigrams scored", static_cast<double>(n), 228146);
+    loss.close("average nll", nll, 2.4541, 1e-3);
+    loss.report();
 
     // A bigram the training set never saw sends the loss to infinity.
     const std::vector<std::string> probe = { "andrejq" };

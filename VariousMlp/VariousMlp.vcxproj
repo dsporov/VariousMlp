@@ -127,6 +127,9 @@
     <ClCompile Include="Karpathy\micrograd.cpp" />
     <ClCompile Include="VariousMlp.cpp" />
   </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="Karpathy\check.h" />
+  </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>

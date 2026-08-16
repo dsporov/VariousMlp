@@ -28,4 +28,9 @@
       <Filter>Karpathy</Filter>
     </ClCompile>
   </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="Karpathy\check.h">
+      <Filter>Karpathy</Filter>
+    </ClInclude>
+  </ItemGroup>
 </Project>
