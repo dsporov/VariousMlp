@@ -21,7 +21,10 @@
     <ClCompile Include="VariousMlp.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="micrograd.cpp">
+    <ClCompile Include="Karpathy\micrograd.cpp">
+      <Filter>Karpathy</Filter>
+    </ClCompile>
+    <ClCompile Include="Karpathy\makemore_bigram.cpp">
       <Filter>Karpathy</Filter>
     </ClCompile>
   </ItemGroup>

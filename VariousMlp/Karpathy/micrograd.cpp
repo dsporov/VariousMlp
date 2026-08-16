@@ -313,8 +313,10 @@ void example_training() {
     for (int step = 0; step < 100; ++step) {
         // forward: rebuild the graph each step, exactly like the Python version
         std::vector<Value> ypred;
-        for (const auto& x : xs)
-            ypred.push_back(net(x)[0]);
+        for (const auto& x : xs) {
+            auto out = net(x);
+            ypred.push_back(out[0]);
+        }
 
         Value loss(0.0);
         for (size_t i = 0; i < ys.size(); ++i)
