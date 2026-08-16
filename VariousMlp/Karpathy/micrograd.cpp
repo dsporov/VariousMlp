@@ -74,7 +74,7 @@ Value operator+(const Value& a, const Value& b) {
     out.node()->backward = [o, x, y] {
         x->grad += o->grad;   // += , not = : a node used twice accumulates
         y->grad += o->grad;
-        };
+    };
     return out;
 }
 
@@ -85,7 +85,7 @@ Value operator*(const Value& a, const Value& b) {
     out.node()->backward = [o, x, y] {
         x->grad += y->data * o->grad;
         y->grad += x->data * o->grad;
-        };
+    };
     return out;
 }
 
@@ -95,7 +95,7 @@ Value pow(const Value& a, double k) {
     NodePtr x = a.node();
     out.node()->backward = [o, x, k] {
         x->grad += k * std::pow(x->data, k - 1) * o->grad;
-        };
+    };
     return out;
 }
 
@@ -141,7 +141,7 @@ void Value::backward() {
         if (!visited.insert(v).second) return;
         for (const auto& c : v->prev) build(c.get());
         topo.push_back(v);   // pushed only after all children -> topological
-        };
+    };
     build(n_.get());
 
     n_->grad = 1.0;
@@ -154,7 +154,7 @@ void Value::zero_grad() {
         if (!visited.insert(v).second) return;
         v->grad = 0.0;
         for (const auto& c : v->prev) walk(c.get());
-        };
+    };
     walk(n_.get());
 }
 
@@ -176,7 +176,7 @@ std::string to_dot(const Value& root) {
             walk(c.get());
             os << "  \"" << c.get() << "\" -> \"" << v << v->op << "\";\n";
         }
-        };
+    };
     walk(root.node().get());
     os << "}\n";
     return os.str();
@@ -190,42 +190,49 @@ static std::mt19937 rng(1337);
 static std::uniform_real_distribution<double> unif(-1.0, 1.0);
 
 struct Neuron {
-    std::vector<Value> w;
-    Value b;
+    std::vector<Value> w_;
+    Value b_;
 
-    explicit Neuron(int nin) : b(unif(rng)) {
-        for (int i = 0; i < nin; ++i) w.emplace_back(unif(rng));
+    explicit Neuron(int inputs)
+        : b_(unif(rng))
+    {
+        for (int i = 0; i < inputs; ++i)
+            w_.emplace_back(unif(rng));
     }
 
     Value operator()(const std::vector<Value>& x) const {
-        Value act = b;
-        for (size_t i = 0; i < w.size(); ++i) act = act + w[i] * x[i];
+        Value act = b_;
+        for (size_t i = 0; i < w_.size(); ++i)
+            act = act + w_[i] * x[i];
         return tanh(act);
     }
 
     std::vector<Value> parameters() const {
-        std::vector<Value> p = w;
-        p.push_back(b);
+        std::vector<Value> p = w_;
+        p.push_back(b_);
         return p;
     }
 };
 
 struct Layer {
-    std::vector<Neuron> neurons;
+    std::vector<Neuron> neurons_;
 
-    Layer(int nin, int nout) {
-        for (int i = 0; i < nout; ++i) neurons.emplace_back(nin);
+    Layer(int inputs, int outputs) {
+        // outputs = neurons count
+        for (int i = 0; i < outputs; ++i)
+            neurons_.emplace_back(inputs);
     }
 
     std::vector<Value> operator()(const std::vector<Value>& x) const {
         std::vector<Value> out;
-        for (const auto& n : neurons) out.push_back(n(x));
+        for (const auto& n : neurons_)
+            out.push_back(n(x));
         return out;
     }
 
     std::vector<Value> parameters() const {
         std::vector<Value> p;
-        for (const auto& n : neurons) {
+        for (const auto& n : neurons_) {
             auto q = n.parameters();
             p.insert(p.end(), q.begin(), q.end());
         }
@@ -234,21 +241,25 @@ struct Layer {
 };
 
 struct MLP {
-    std::vector<Layer> layers;
+    std::vector<Layer> layers_;
 
-    MLP(int nin, const std::vector<int>& nouts) {
-        int prev = nin;
-        for (int n : nouts) { layers.emplace_back(prev, n); prev = n; }
+    MLP(int inputs, const std::vector<int>& outputs) {
+        int prev_inputs = inputs;
+        for (int n : outputs) {
+            layers_.emplace_back(prev_inputs, n);
+            prev_inputs = n;
+        }
     }
 
     std::vector<Value> operator()(std::vector<Value> x) const {
-        for (const auto& l : layers) x = l(x);
+        for (const auto& l : layers_)
+            x = l(x);
         return x;
     }
 
     std::vector<Value> parameters() const {
         std::vector<Value> p;
-        for (const auto& l : layers) {
+        for (const auto& l : layers_) {
             auto q = l.parameters();
             p.insert(p.end(), q.begin(), q.end());
         }
@@ -302,7 +313,8 @@ void example_training() {
     for (int step = 0; step < 100; ++step) {
         // forward: rebuild the graph each step, exactly like the Python version
         std::vector<Value> ypred;
-        for (const auto& x : xs) ypred.push_back(net(x)[0]);
+        for (const auto& x : xs)
+            ypred.push_back(net(x)[0]);
 
         Value loss(0.0);
         for (size_t i = 0; i < ys.size(); ++i)
@@ -313,7 +325,8 @@ void example_training() {
         loss.backward();
 
         // update
-        for (auto& p : net.parameters()) p.data() += -0.05 * p.grad();
+        for (auto& p : net.parameters())
+            p.data() += -0.05 * p.grad();
 
         if (step % 20 == 0 || step == 99)
             printf("  step %3d  loss %.8f\n", step, loss.data());
