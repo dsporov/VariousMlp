@@ -14,8 +14,6 @@
 // Part 4 does full-batch gradient descent over all 228146 bigrams, 100 steps:
 // ~6s in Release, ~24s in Debug. Prefer Release if you are iterating.
 //
-// Build:  g++ -std=c++17 -O2 makemore_bigram.cpp -o makemore
-// Run:    ./makemore
 
 #include <algorithm>
 #include <chrono>
@@ -75,15 +73,18 @@ std::vector<std::string> load_names() {
         std::string line;
         size_t skipped = 0;
         while (std::getline(f, line)) {
-            if (!line.empty() && line.back() == '\r') line.pop_back();  // CRLF
             if (line.empty()) continue;
+            if (line.back() == '\r')
+                line.pop_back();  // CRLF
             // The model has exactly 27 tokens, so a stray uppercase letter,
             // digit or accent has nowhere to go. Drop those lines here rather
             // than letting encode() abort the whole run over one bad name.
             const bool clean = std::all_of(line.begin(), line.end(),
                 [](char c) { return c >= 'a' && c <= 'z'; });
-            if (clean) words.push_back(line);
-            else ++skipped;
+            if (clean)
+                words.push_back(line);
+            else
+                ++skipped;
         }
         if (!words.empty()) {
             printf("  loaded %zu names from %s\n", words.size(), path);
@@ -114,8 +115,11 @@ void for_each_bigram(const std::string& w, F&& f) {
 
 std::vector<int> count_bigrams(const std::vector<std::string>& words) {
     std::vector<int> N(kVocab * kVocab, 0);
-    for (const auto& w : words)
-        for_each_bigram(w, [&](int a, int b) { ++N[a * kVocab + b]; });
+    for (const auto& w : words) {
+        for_each_bigram(w, [&](int a, int b) {
+            ++N[a * kVocab + b];
+        });
+    }
     return N;
 }
 
@@ -127,7 +131,9 @@ void print_top_bigrams(const std::vector<int>& N, int k) {
 
     std::vector<std::pair<int, int>> flat;         // (count, flat index)
     flat.reserve(N.size());
-    for (int i = 0; i < static_cast<int>(N.size()); ++i) flat.emplace_back(N[i], i);
+    for (int i = 0; i < static_cast<int>(N.size()); ++i) {
+        flat.emplace_back(N[i], i);
+    }
     std::sort(flat.begin(), flat.end(), std::greater<>());
 
     printf("  top %d bigrams:\n", k);
@@ -329,11 +335,14 @@ void train_neural_net(const std::vector<std::string>& words, double count_model_
         // gradient-descent equivalent of add-one smoothing on the counts.
         const double scale = 1.0 / (kVocab * kVocab);
         double sq = 0.0;
-        for (double w : W) sq += w * w;
+        for (double w : W)
+            sq += w * w;
         loss += reg * sq * scale;
-        for (int k = 0; k < kVocab * kVocab; ++k) dW[k] += reg * 2.0 * W[k] * scale;
+        for (int k = 0; k < kVocab * kVocab; ++k)
+            dW[k] += reg * 2.0 * W[k] * scale;
 
-        for (int k = 0; k < kVocab * kVocab; ++k) W[k] -= lr * dW[k];
+        for (int k = 0; k < kVocab * kVocab; ++k)
+            W[k] -= lr * dW[k];
 
         if (step == 0) first_loss = loss;
         last_loss = loss;
@@ -401,7 +410,8 @@ void test_makemore() {
         longest = std::max(longest, w.size());
     }
     std::cout << "  first 8: ";
-    for (size_t i = 0; i < std::min<size_t>(8, words.size()); ++i) std::cout << words[i] << " ";
+    for (size_t i = 0; i < std::min<size_t>(8, words.size()); ++i)
+        std::cout << words[i] << " ";
     printf("\n  lengths %zu..%zu\n", shortest, longest);
 
     // Everything below is checked against the video, which means checked
@@ -422,7 +432,8 @@ void test_makemore() {
     // The counting step is the foundation for both models, so pin the four
     // counts the video reads out loud plus the total.
     long long total = 0;
-    for (int c : N) total += c;
+    for (int c : N)
+        total += c;
     sanity::Expect counts;
     counts.equal("n. count", N[encode('n') * kVocab + encode('.')], 6763);
     counts.equal("a. count", N[encode('a') * kVocab + encode('.')], 6640);
@@ -440,7 +451,8 @@ void test_makemore() {
     // "untrained" looks like.
     const std::vector<double> uniform(kVocab * kVocab, 1.0 / kVocab);
     std::cout << "  uniform model:  ";
-    for (int i = 0; i < 5; ++i) std::cout << sample_name(uniform, g) << " ";
+    for (int i = 0; i < 5; ++i)
+        std::cout << sample_name(uniform, g) << " ";
 
     const std::vector<double> P = row_normalise(N, 0.0);
     std::cout << "\n  bigram model:   ";
