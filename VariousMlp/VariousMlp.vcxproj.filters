@@ -27,6 +27,9 @@
     <ClCompile Include="Karpathy\makemore_bigram.cpp">
       <Filter>Karpathy</Filter>
     </ClCompile>
+    <ClCompile Include="Karpathy\makemore_mlp.cpp">
+      <Filter>Karpathy</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Karpathy\check.h">

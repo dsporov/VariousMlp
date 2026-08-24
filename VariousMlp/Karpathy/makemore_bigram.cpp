@@ -163,7 +163,8 @@ void check_rows_sum_to_one(const std::vector<double>& P, const char* what) {
         << kVocab << " matrix, got " << P.size() << " entries");
     for (int i = 0; i < kVocab; ++i) {
         double sum = 0.0;
-        for (int j = 0; j < kVocab; ++j) sum += P[i * kVocab + j];
+        for (int j = 0; j < kVocab; ++j)
+            sum += P[i * kVocab + j];
         CHECK(std::fabs(sum - 1.0) < 1e-12,
             what << ": row '" << decode(i) << "' sums to " << sum << ", not 1");
     }
@@ -179,13 +180,19 @@ std::vector<double> row_normalise(const std::vector<int>& N, double smoothing) {
     std::vector<double> P(N.size());
     for (int i = 0; i < kVocab; ++i) {
         double sum = 0.0;
-        for (int j = 0; j < kVocab; ++j) sum += N[i * kVocab + j] + smoothing;
+        for (int j = 0; j < kVocab; ++j) {
+            sum += N[i * kVocab + j] + smoothing;
+        }
+        
         // A character that never starts a bigram leaves an all-zero row, and
         // 0/0 would quietly fill it with NaN.
         CHECK(sum > 0.0, "no counts in the row for '" << decode(i)
             << "'; pass smoothing > 0 to make it a valid distribution");
-        for (int j = 0; j < kVocab; ++j) P[i * kVocab + j] = (N[i * kVocab + j] + smoothing) / sum;
+        for (int j = 0; j < kVocab; ++j) {
+            P[i * kVocab + j] = (N[i * kVocab + j] + smoothing) / sum;
+        }
     }
+    
     check_rows_sum_to_one(P, "normalised counts");
     return P;
 }
@@ -210,12 +217,15 @@ std::string sample_name(const std::vector<double>& P, std::mt19937& g) {
     for (;;) {
         const double* row = &P[ix * kVocab];
         double sum = 0.0;
-        for (int j = 0; j < kVocab; ++j) sum += row[j];
+        for (int j = 0; j < kVocab; ++j) {
+            sum += row[j];
+        }
         CHECK(sum > 0.0, "row '" << decode(ix) << "' has no probability mass to sample from");
 
         std::discrete_distribution<int> dist(row, row + kVocab);
         ix = dist(g);
-        if (ix == 0) break;                        // sampled the end token
+        if (ix == 0)
+            break;                        // sampled the end token
         out.push_back(decode(ix));
         CHECK(out.size() < kMaxLength,
             "sampling ran past " << kMaxLength << " characters without an end token");
@@ -240,54 +250,239 @@ double average_nll(const std::vector<std::string>& words,
         for_each_bigram(w, [&](int a, int b) {
             log_likelihood += std::log(P[a * kVocab + b]);
             ++n;
-            });
+        });
     }
+
     // Every word contributes at least one bigram, so n == 0 would mean the
     // padding in for_each_bigram stopped working. (An unseen bigram still gives
     // -inf here on purpose: that is the point the walkthrough makes with
     // 'andrejq' before it introduces smoothing.)
     CHECK(n > 0, "scored " << words.size() << " words but counted no bigrams");
-    if (bigrams_out) *bigrams_out = n;
+
+    if (bigrams_out)
+        *bigrams_out = n;
     return -log_likelihood / static_cast<double>(n);
 }
 
 // ---------------------------------------------------------------------------
 // 4. The same model as a neural net
 // ---------------------------------------------------------------------------
+//
+// The network is one linear layer and nothing else, which is easy to lose in
+// the video's `W = torch.randn((27, 27))`. Naming it is what the two types
+// below are for: 27 neurons, 27 weights each, no bias, and no activation
+// function, because the softmax in softmax_cross_entropy is the only
+// nonlinearity in the model. That makes this multinomial logistic regression -
+// the hidden layer, and with it the name MLP, only arrives in the next video.
 
-// Every index here becomes raw pointer arithmetic into W below, so a bad one is
-// an out-of-bounds write rather than a wrong answer. One pass over the dataset,
-// before training starts; the training loop itself stays check-free.
+// Softmax over one row of kVocab logits. Subtracting the row max first costs
+// nothing and keeps exp() away from overflow; softmax is invariant to it.
+void softmax(const double* logits, double* probs) {
+    const double maxl = *std::max_element(logits, logits + kVocab);
+    double denom = 0.0;
+    for (int j = 0; j < kVocab; ++j) {
+        probs[j] = std::exp(logits[j] - maxl);
+        denom += probs[j];
+    }
+    for (int j = 0; j < kVocab; ++j) {
+        probs[j] /= denom;
+    }
+}
+
+// A single neuron: kInputs weights and no bias. It is a view onto the layer
+// rather than an owner of its own weights, because LinearLayer stores all 27
+// neurons interleaved and a neuron's weights are therefore a strided column.
+class Neuron {
+public:
+    static constexpr int kInputs = kVocab;
+
+    Neuron(const double* first_weight, int stride)
+        : w_(first_weight), stride_(stride)
+    {
+    }
+
+    // The weight this neuron puts on `input`. It is also the neuron's output
+    // for that input: the dot product collapses when the input is one-hot,
+    // since every term but one is multiplied by zero. That is why exp(W) ends
+    // up resembling the count matrix - each weight is a log count in disguise.
+    double weight(int input) const {
+        CHECK(input >= 0 && input < kInputs,
+            "input " << input << " is outside [0, " << kInputs << ")");
+        return w_[input * stride_];
+    }
+
+private:
+    const double* w_;
+    int stride_;
+};
+
+// The whole network: one layer, kNeurons wide, holding the weights and their
+// gradients side by side the way micrograd's Value holds .data and .grad.
+//
+// Storage is input-major - w_[input * kNeurons + neuron] - which is the
+// transpose of "each neuron owns a contiguous array". That is deliberate: a
+// one-hot input needs all 27 neurons' weights for one character, and this
+// layout makes that a single contiguous row. The video makes the same point
+// from the other side, that one_hot(x) @ W is an expensive way to spell an
+// array index.
+class LinearLayer {
+public:
+    static constexpr int kNeurons = kVocab;
+    static constexpr int kInputs = kVocab;
+    static constexpr int kParameters = kNeurons * kInputs;
+
+    explicit LinearLayer(std::mt19937& g)
+        : w_(kParameters), dw_(kParameters, 0.0)
+    {
+        std::normal_distribution<double> randn(0.0, 1.0);
+        for (auto& v : w_) {
+            v = randn(g);
+        }
+    }
+
+    Neuron neuron(int j) const {
+        CHECK(j >= 0 && j < kNeurons,
+            "neuron " << j << " is outside [0, " << kNeurons << ")");
+        return Neuron(&w_[j], kNeurons);
+    }
+
+    // The logits for a one-hot input, one per neuron. Unchecked on purpose:
+    // this is the inner loop, and validate_examples has already established
+    // that every x and y in the training set indexes a real row.
+    const double* logits(int input) const {
+        return &w_[input * kNeurons];
+    }
+
+    // Where the backward pass accumulates d(loss)/d(logits) for that same row.
+    double* dlogits(int input) {
+        return &dw_[input * kNeurons];
+    }
+
+    void zero_grad() {
+        std::fill(dw_.begin(), dw_.end(), 0.0);
+    }
+
+    // The video's 0.01 * (W**2).mean(): gravity pulling every weight toward
+    // zero, which is what add-one smoothing on the counts looks like from the
+    // gradient-descent side. Folds the penalty's gradient in and returns the
+    // penalty itself, so the caller can report the loss it was trained on.
+    double add_l2_penalty(double reg) {
+        const double scale = 1.0 / kParameters;
+        double sq = 0.0;
+        for (int k = 0; k < kParameters; ++k) {
+            sq += w_[k] * w_[k];
+            dw_[k] += reg * 2.0 * w_[k] * scale;
+        }
+        return reg * sq * scale;
+    }
+
+    void step(double lr) {
+        for (int k = 0; k < kParameters; ++k) {
+            w_[k] -= lr * dw_[k];
+        }
+    }
+
+    // The trained layer as a 27x27 probability matrix, which lets the count
+    // model's scoring and sampling code run unchanged on the neural net.
+    std::vector<double> probabilities() const {
+        std::vector<double> P(kParameters);
+        for (int i = 0; i < kInputs; ++i) {
+            softmax(logits(i), &P[i * kNeurons]);
+        }
+        return P;
+    }
+
+private:
+    std::vector<double> w_;
+    std::vector<double> dw_;
+};
+
+// Softmax and negative log likelihood for one example, fused. Returns the loss
+// and accumulates scale * d(loss)/d(logits) into `dlogits`.
+//
+// The pair collapses to one line: for softmax followed by NLL the gradient is
+// probs - onehot(target). That is what loss.backward() derives in the video,
+// and writing it by hand is what keeps this file independent of the micrograd
+// engine - 228k examples x 27 classes would be ~14M Value nodes per step.
+double softmax_cross_entropy(const double* logits, int target, double scale,
+    double* dlogits) {
+    double probs[kVocab];
+    softmax(logits, probs);
+    for (int j = 0; j < kVocab; ++j) {
+        dlogits[j] += (probs[j] - (j == target ? 1.0 : 0.0)) * scale;
+    }
+    return -std::log(probs[target]);
+}
+
+// One neuron's-eye view of the trained layer, because the claim that these 27
+// objects are the entire model is easier to believe when you can see one.
+// Neuron j votes for character j, so its strongest weights should be the
+// characters that most often precede it.
+void print_neuron(const LinearLayer& layer, int j, int top_k) {
+    CHECK(top_k > 0 && top_k <= Neuron::kInputs,
+        "asked for the top " << top_k << " of " << Neuron::kInputs << " weights");
+
+    const Neuron n = layer.neuron(j);
+    std::vector<std::pair<double, int>> flat;      // (weight, input)
+    flat.reserve(Neuron::kInputs);
+    for (int i = 0; i < Neuron::kInputs; ++i) {
+        flat.emplace_back(n.weight(i), i);
+    }
+    std::sort(flat.begin(), flat.end(), std::greater<>());
+
+    printf("  neuron '%c' (%d weights, no bias), strongest inputs:",
+        decode(j), Neuron::kInputs);
+    for (int i = 0; i < top_k; ++i) {
+        printf("  %c%c %+.2f", decode(flat[i].second), decode(j), flat[i].first);
+    }
+    printf("\n");
+}
+
+// Every index here becomes raw pointer arithmetic into the layer, so a bad one
+// is an out-of-bounds write rather than a wrong answer. One pass over the
+// dataset, before training starts; the training loop itself stays check-free.
 void validate_examples(const std::vector<int>& xs, const std::vector<int>& ys) {
     CHECK(!xs.empty(), "no training examples");
     CHECK(xs.size() == ys.size(),
         xs.size() << " inputs but " << ys.size() << " targets");
-    for (size_t i = 0; i < xs.size(); ++i)
+
+    for (size_t i = 0; i < xs.size(); ++i) {
         CHECK(xs[i] >= 0 && xs[i] < kVocab && ys[i] >= 0 && ys[i] < kVocab,
             "example " << i << " is (" << xs[i] << ", " << ys[i]
             << "), outside [0, " << kVocab << ")");
+    }
 }
 
 void train_neural_net(const std::vector<std::string>& words, double count_model_loss) {
-    // The training set: one example per bigram.
+    // The training set: one example per bigram. xs and ys hold the same
+    // characters offset by one, so a single stream of N+1 tokens could serve as
+    // both - xs reading from index 0, ys from index 1 - with the '.' between
+    // two names doing double duty as the end of one and the start of the next.
+    // That is how language models normally store their data, and it is
+    // deliberately not done here: two named arrays match the video, and the
+    // duplicate copy costs under a megabyte.
     std::vector<int> xs, ys;
     for (const auto& w : words) {
-        for_each_bigram(w, [&](int a, int b) { xs.push_back(a); ys.push_back(b); });
+        for_each_bigram(w, [&](int a, int b) {
+            xs.push_back(a);
+            ys.push_back(b);
+        });
     }
+
     const size_t num = xs.size();
     printf("  %zu bigram examples\n", num);
+    printf("  network: 1 linear layer, %d neurons x %d weights, no bias, "
+        "no activation (%d parameters)\n",
+        LinearLayer::kNeurons, LinearLayer::kInputs, LinearLayer::kParameters);
 
     validate_examples(xs, ys);
 
     // W = torch.randn((27, 27), requires_grad=True)
     std::mt19937 g(2147483647);
-    std::normal_distribution<double> randn(0.0, 1.0);
-    std::vector<double> W(kVocab * kVocab);
-    for (auto& w : W) w = randn(g);
+    LinearLayer layer(g);
 
     double first_loss = 0.0, last_loss = 0.0;
 
-    std::vector<double> dW(kVocab * kVocab);
     const double inv_n = 1.0 / static_cast<double>(num);
     const double reg = 0.01;        // the video's 0.01 * (W**2).mean()
     const double lr = 50.0;         // W.data += -50 * W.grad
@@ -296,74 +491,39 @@ void train_neural_net(const std::vector<std::string>& words, double count_model_
     const auto t0 = std::chrono::steady_clock::now();
 
     for (int step = 0; step < steps; ++step) {
-        std::fill(dW.begin(), dW.end(), 0.0);
+        layer.zero_grad();
+
+        // Forward and backward in the same pass: each example reads the row of
+        // logits its input character selects, and writes that row's gradient
+        // straight back.
         double loss = 0.0;
-        double probs[kVocab];
-
         for (size_t i = 0; i < num; ++i) {
-            const int x = xs[i], y = ys[i];
-
-            // Forward. one_hot(x) @ W is just row x of W - as the video points
-            // out, the matmul is an expensive way to spell an array index.
-            const double* row = &W[x * kVocab];
-
-            // Subtracting the row max before exp is a free guard against
-            // overflow; softmax is invariant to it.
-            const double maxl = *std::max_element(row, row + kVocab);
-            double denom = 0.0;
-            for (int j = 0; j < kVocab; ++j) {
-                probs[j] = std::exp(row[j] - maxl);
-                denom += probs[j];
-            }
-            for (int j = 0; j < kVocab; ++j) probs[j] /= denom;
-
-            loss += -std::log(probs[y]);
-
-            // Backward. For softmax + negative log likelihood the gradient
-            // collapses to d(loss)/d(logits) = probs - onehot(y), averaged over
-            // the batch. That is exactly what loss.backward() derives in the
-            // video; written out by hand it is one line, and it keeps this file
-            // independent of the micrograd engine (228k examples x 27 classes
-            // would be ~14M Value nodes per step).
-            double* drow = &dW[x * kVocab];
-            for (int j = 0; j < kVocab; ++j)
-                drow[j] += (probs[j] - (j == y ? 1.0 : 0.0)) * inv_n;
+            const int x = xs[i];
+            const double* logits = layer.logits(x);
+            double* dlogits = layer.dlogits(x);
+            loss += softmax_cross_entropy(logits, ys[i], inv_n, dlogits);
         }
-        loss *= inv_n;
+        loss = loss * inv_n + layer.add_l2_penalty(reg);
 
-        // L2 regularisation: the "gravity" pulling W toward zero, which is the
-        // gradient-descent equivalent of add-one smoothing on the counts.
-        const double scale = 1.0 / (kVocab * kVocab);
-        double sq = 0.0;
-        for (double w : W)
-            sq += w * w;
-        loss += reg * sq * scale;
-        for (int k = 0; k < kVocab * kVocab; ++k)
-            dW[k] += reg * 2.0 * W[k] * scale;
+        layer.step(lr);
 
-        for (int k = 0; k < kVocab * kVocab; ++k)
-            W[k] -= lr * dW[k];
-
-        if (step == 0) first_loss = loss;
+        if (step == 0) {
+            first_loss = loss;
+        }
         last_loss = loss;
 
-        if (step % 10 == 0 || step == steps - 1)
+        if (step % 10 == 0 || step == steps - 1) {
             printf("    step %3d  loss %.6f (incl. regularisation)\n", step, loss);
+        }
     }
 
     const auto secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     printf("  trained in %.2fs\n", secs);
 
-    // W.exp() should now look like the count matrix: the net rediscovered it.
-    std::vector<double> P(kVocab * kVocab);
-    for (int i = 0; i < kVocab; ++i) {
-        const double* row = &W[i * kVocab];
-        const double maxl = *std::max_element(row, row + kVocab);
-        double denom = 0.0;
-        for (int j = 0; j < kVocab; ++j) { P[i * kVocab + j] = std::exp(row[j] - maxl); denom += P[i * kVocab + j]; }
-        for (int j = 0; j < kVocab; ++j) P[i * kVocab + j] /= denom;
-    }
+    // softmax(W) should now look like the count matrix: the net rediscovered it.
+    const std::vector<double> P = layer.probabilities();
     check_rows_sum_to_one(P, "softmax of W");
+    print_neuron(layer, encode('n'), 5);
 
     // Like-for-like: both numbers below are the plain nll with no regularisation
     // term. The net sits a little above the count model because the L2 pull is
@@ -385,7 +545,9 @@ void train_neural_net(const std::vector<std::string>& words, double count_model_
 
     std::mt19937 gs(2147483647);
     printf("  samples from the trained net: ");
-    for (int i = 0; i < 5; ++i) printf("%s ", sample_name(P, gs).c_str());
+    for (int i = 0; i < 5; ++i) {
+        printf("%s ", sample_name(P, gs).c_str());
+    }
     printf("\n\n");
 }
 
@@ -456,7 +618,8 @@ void test_makemore() {
 
     const std::vector<double> P = row_normalise(N, 0.0);
     std::cout << "\n  bigram model:   ";
-    for (int i = 0; i < 5; ++i) std::cout << sample_name(P, g) << " ";
+    for (int i = 0; i < 5; ++i)
+        std::cout << sample_name(P, g) << " ";
     std::cout << "\n  (names differ from the video: torch's RNG stream is not "
         "reproducible here)\n\n";
 

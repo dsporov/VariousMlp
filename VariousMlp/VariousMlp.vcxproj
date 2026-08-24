@@ -124,6 +124,7 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="Karpathy\makemore_bigram.cpp" />
+    <ClCompile Include="Karpathy\makemore_mlp.cpp" />
     <ClCompile Include="Karpathy\micrograd.cpp" />
     <ClCompile Include="VariousMlp.cpp" />
   </ItemGroup>
