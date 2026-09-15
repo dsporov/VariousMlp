@@ -135,11 +135,13 @@
     <ClCompile Include="Karpathy\makemore_bigram.cpp" />
     <ClCompile Include="Karpathy\makemore_mlp.cpp" />
     <ClCompile Include="Karpathy\gpt.cpp" />
+    <ClCompile Include="Karpathy\gpt_chat.cpp" />
     <ClCompile Include="Karpathy\micrograd.cpp" />
     <ClCompile Include="VariousMlp.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Karpathy\check.h" />
+    <ClInclude Include="Karpathy\gpt_model.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

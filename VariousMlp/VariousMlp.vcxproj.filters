@@ -36,9 +36,15 @@
     <ClCompile Include="Karpathy\gpt.cpp">
       <Filter>Karpathy</Filter>
     </ClCompile>
+    <ClCompile Include="Karpathy\gpt_chat.cpp">
+      <Filter>Karpathy</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Karpathy\check.h">
+      <Filter>Karpathy</Filter>
+    </ClInclude>
+    <ClInclude Include="Karpathy\gpt_model.h">
       <Filter>Karpathy</Filter>
     </ClInclude>
   </ItemGroup>
