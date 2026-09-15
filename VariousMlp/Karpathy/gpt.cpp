@@ -45,10 +45,21 @@
 #include <memory>
 #include <random>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
 #include "check.h"
+
+// Neither MSVC nor gcc will vectorise a loop that stores through one pointer
+// and loads through another unless it can prove the two do not overlap, and
+// const says nothing about that. Every use below is on pointers into distinct
+// vectors; the comment at each one says which.
+#if defined(_MSC_VER) || defined(__GNUC__)
+#define RESTRICT __restrict
+#else
+#define RESTRICT
+#endif
 
 namespace {
 
@@ -309,14 +320,14 @@ public:
         out_.resize(x.batch, x.time, fan_out_);
         const int n = x.rows();
         for (int i = 0; i < n; ++i) {
-            const real* xi = x.row(i);
-            real* oi = out_.row(i);
+            const real* RESTRICT xi = x.row(i);
+            real* RESTRICT oi = out_.row(i);
             if (has_bias_) {
                 std::copy(b_.begin(), b_.end(), oi);
             }
             for (int k = 0; k < fan_in_; ++k) {
                 const real xk = xi[k];
-                const real* wk = &w_[static_cast<size_t>(k) * fan_out_];
+                const real* RESTRICT wk = &w_[static_cast<size_t>(k) * fan_out_];
                 for (int j = 0; j < fan_out_; ++j) {
                     oi[j] += xk * wk[j];
                 }
@@ -330,17 +341,17 @@ public:
         dx_.resize(x.batch, x.time, fan_in_);
         const int n = x.rows();
         for (int i = 0; i < n; ++i) {
-            const real* di = dout.row(i);
-            const real* xi = x.row(i);
-            real* dxi = dx_.row(i);
+            const real* RESTRICT di = dout.row(i);
+            const real* RESTRICT xi = x.row(i);
+            real* RESTRICT dxi = dx_.row(i);
             if (has_bias_) {
                 for (int j = 0; j < fan_out_; ++j) {
                     db_[j] += di[j];
                 }
             }
             for (int k = 0; k < fan_in_; ++k) {
-                const real* wk = &w_[static_cast<size_t>(k) * fan_out_];
-                real* dwk = &dw_[static_cast<size_t>(k) * fan_out_];
+                const real* RESTRICT wk = &w_[static_cast<size_t>(k) * fan_out_];
+                real* RESTRICT dwk = &dw_[static_cast<size_t>(k) * fan_out_];
                 const real xk = xi[k];
                 real acc = 0;
                 for (int j = 0; j < fan_out_; ++j) {
@@ -423,8 +434,8 @@ public:
             const real inv = real(1) / std::sqrt(var + eps_);
             invstd_[static_cast<size_t>(i)] = inv;
 
-            real* xh = xhat_.row(i);
-            real* oi = out_.row(i);
+            real* RESTRICT xh = xhat_.row(i);
+            real* RESTRICT oi = out_.row(i);
             for (int j = 0; j < dim_; ++j) {
                 xh[j] = (xi[j] - mean) * inv;
                 oi[j] = gamma_[j] * xh[j] + beta_[j];
@@ -446,9 +457,9 @@ public:
 
         const real inv_c = real(1) / dim_;
         for (int i = 0; i < n; ++i) {
-            const real* di = dout.row(i);
-            const real* xh = xhat_.row(i);
-            real* dxi = dx_.row(i);
+            const real* RESTRICT di = dout.row(i);
+            const real* RESTRICT xh = xhat_.row(i);
+            real* RESTRICT dxi = dx_.row(i);
 
             real sum_d = 0;
             real sum_dx = 0;
@@ -710,12 +721,12 @@ public:
             for (int h = 0; h < n_head_; ++h) {
                 const int bh = b * n_head_ + h;
                 for (int t = 0; t < T; ++t) {
-                    const real* dO = dheads.row(b, t) + h * hs_;
-                    const real* p = a.row(bh, t);
-                    real* dA = da_.row(bh, t);
+                    const real* RESTRICT dO = dheads.row(b, t) + h * hs_;
+                    const real* RESTRICT p = a.row(bh, t);
+                    real* RESTRICT dA = da_.row(bh, t);
                     for (int u = 0; u <= t; ++u) {
-                        const real* vi = v.row(b, u) + h * hs_;
-                        real* dvi = dv_.row(b, u) + h * hs_;
+                        const real* RESTRICT vi = v.row(b, u) + h * hs_;
+                        real* RESTRICT dvi = dv_.row(b, u) + h * hs_;
                         real dot = 0;
                         const real w = p[u];
                         for (int dd = 0; dd < hs_; ++dd) {
@@ -756,12 +767,12 @@ public:
             for (int h = 0; h < n_head_; ++h) {
                 const int bh = b * n_head_ + h;
                 for (int t = 0; t < T; ++t) {
-                    const real* ds = ds_.row(bh, t);
-                    const real* qi = q.row(b, t) + h * hs_;
-                    real* dqi = dq_.row(b, t) + h * hs_;
+                    const real* RESTRICT ds = ds_.row(bh, t);
+                    const real* RESTRICT qi = q.row(b, t) + h * hs_;
+                    real* RESTRICT dqi = dq_.row(b, t) + h * hs_;
                     for (int u = 0; u <= t; ++u) {
-                        const real* ki = k.row(b, u) + h * hs_;
-                        real* dki = dk_.row(b, u) + h * hs_;
+                        const real* RESTRICT ki = k.row(b, u) + h * hs_;
+                        real* RESTRICT dki = dk_.row(b, u) + h * hs_;
                         const real s = ds[u] * scale;
                         for (int dd = 0; dd < hs_; ++dd) {
                             dqi[dd] += s * ki[dd];
@@ -1562,7 +1573,17 @@ void gradient_check(const Data& d, std::mt19937& g) {
     constexpr int kCheckBatch = 3;
     constexpr int kCheckTime = 5;
     constexpr int kProbesPerParam = 3;
-    constexpr real kH = real(1e-6);
+
+    // Central differences cancel the leading error terms and spend about half
+    // the mantissa doing it, so both the usable step size and the achievable
+    // agreement follow the scalar type. double leaves room for a 1e-6 step and
+    // lands near 1e-9; float cannot go below about 1e-3 without the subtraction
+    // losing every significant digit, and lands two orders of magnitude worse.
+    // The check is much weaker in float, but it still catches a wrong sign, a
+    // dropped term or a missing Bessel factor, which is what it is for.
+    constexpr bool kIsFloat = std::is_same<real, float>::value;
+    constexpr real kH = kIsFloat ? real(1e-3) : real(1e-6);
+    constexpr real kTolerance = kIsFloat ? real(3e-2) : real(1e-6);
 
     const Config tiny{ 8, 2, 2, kCheckTime, kCheckBatch, real(0), real(1e-3) };
     Gpt model(tiny, d.vocab, g);
@@ -1628,11 +1649,8 @@ void gradient_check(const Data& d, std::mt19937& g) {
         worst_where.empty() ? "none" : worst_where.c_str());
 
     sanity::Expect chk;
-    // Central differences at h = 1e-6 in double are good to about 1e-9 here,
-    // and a genuinely wrong expression disagrees in the first digit or two.
-    // The threshold sits between the two with room on both sides.
     chk.that("every hand-written gradient matches central differences",
-        worst < real(1e-6));
+        worst < kTolerance);
     chk.report();
 }
 
@@ -1666,6 +1684,48 @@ constexpr int kBigBlock = 256;
 constexpr int kBigBatch = 64;
 constexpr real kBigDropout = real(0.2);
 constexpr real kBigLr = real(3e-4);
+
+// Roughly what one training step costs. The forward pass is two multiply-adds
+// per parameter per token and the backward pass is twice that again, which is
+// the standard 6N estimate; the two embedding tables come out because they are
+// lookups rather than matrix multiplies. Attention's own two matmuls are not
+// parameters at all, and at context 256 they stop being a rounding error.
+double step_flops(const Config& cfg, size_t params, int vocab) {
+    const double lookups = static_cast<double>(vocab + cfg.block) * cfg.n_embd;
+    const double matmul = static_cast<double>(params) - lookups;
+    const double tokens = static_cast<double>(cfg.batch) * cfg.block;
+    const double attention = 6.0 * cfg.block * (cfg.block + 1.0)
+        * cfg.n_embd * cfg.batch * cfg.n_layer;
+    return 6.0 * matmul * tokens + attention;
+}
+
+// The same for a whole training run, including the evaluation passes, which
+// are a sixth of the total and would otherwise make the throughput below look
+// better than it is.
+double run_flops(const Config& cfg, size_t params, int vocab, int iters,
+    int report_every) {
+    const double per_step = step_flops(cfg, params, vocab);
+    const int reports = (report_every > 0 ? iters / report_every : 0) + 1;
+    const double evals = static_cast<double>(reports) * kEvalIters * 2;
+    return per_step * iters + per_step * evals / 3.0;
+}
+
+// What the layers hold between their forward and backward passes, which is
+// what actually decides whether a configuration fits in memory. Each block
+// keeps on the order of 32 (B, T, C) tensors once the feedforward's 4x hidden
+// width is counted four times over, plus six (B, heads, T, T) attention
+// tensors - and every block keeps its own at the same time. Approximate, and
+// deliberately on the high side.
+double activation_bytes(const Config& cfg) {
+    const double per_block = 32.0 * cfg.block * cfg.n_embd
+        + 6.0 * cfg.n_head * cfg.block * static_cast<double>(cfg.block);
+    return cfg.n_layer * sizeof(real) * cfg.batch * per_block;
+}
+
+// Flip this to actually train the video's final model. Section 8 prints what
+// that would cost on the machine it is running on first, because at the
+// throughput this file currently reaches the answer is measured in weeks.
+constexpr bool kRunScaleUp = false;
 
 // The numbers the video reads out, named so the Expect blocks below are claims
 // rather than magic constants.
@@ -1827,5 +1887,60 @@ void test_gpt() {
         "  Still nonsense, but it is now Shakespeare-shaped nonsense: speaker\n"
         "  names on their own line followed by a colon, blank lines between\n"
         "  speeches, words of plausible length. The bigram model above could not\n"
-        "  do any of that, because none of it fits in one character of context.\n\n";
+        "  do any of that, because none of it fits in one character of context.\n";
+
+    std::cout << "\n== 8. what the scale-up costs ==\n";
+    const Config big{ kBigEmbed, kBigHeads, kBigLayers, kBigBlock, kBigBatch,
+        kBigDropout, kBigLr };
+    printf("  the video's final model: %d channels, %d heads, %d blocks, "
+        "context %d, batch %d,\n  dropout %.2f, lr %.0e\n",
+        big.n_embd, big.n_head, big.n_layer, big.block, big.batch,
+        big.dropout, big.lr);
+
+    // Constructing it costs the weights and their gradients and nothing else -
+    // the activation buffers below are only allocated by a forward pass, which
+    // is the whole point of printing their size before running one.
+    size_t big_params = 0;
+    {
+        std::mt19937 gp(1337);
+        Gpt probe(big, d.vocab, gp);
+        big_params = probe.parameter_count();
+    }
+
+    const double measured = run_flops(cfg, model.parameter_count(), d.vocab,
+        kIters, kReportEvery) / r.seconds;
+    const double projected = run_flops(big, big_params, d.vocab, kIters, kReportEvery);
+    const double bytes = activation_bytes(big);
+
+    printf("  %zu parameters (the video reads 10.788929 M)\n", big_params);
+    printf("  section 6 ran at %.2f GFLOP/s on this machine\n", measured / 1e9);
+    printf("  one step of the scaled-up model is %.2f TFLOP, so %d steps is "
+        "%.1f days\n", step_flops(big, big_params, d.vocab) / 1e12, kIters,
+        projected / measured / 86400.0);
+    printf("  its activation buffers would need about %.1f GB at %zu bytes per "
+        "scalar\n", bytes / 1e9, sizeof(real));
+    std::cout <<
+        "  Which is the honest state of this port: the model is right and the\n"
+        "  arithmetic is not fast enough to use it. Every inner loop here is\n"
+        "  scalar, single-threaded and unblocked, and the three fixes for that -\n"
+        "  vectorising, threading, and blocking for cache - are worth about two\n"
+        "  orders of magnitude between them. That is the difference between a\n"
+        "  month and an overnight run, and it is a separate piece of work.\n";
+
+    // A plain if, not `if constexpr`: the project sets no <LanguageStandard>,
+    // so MSVC builds it as C++14. The branch folds away either way, and the
+    // body still gets compiled and type-checked, which is the point of having
+    // it here rather than in a comment.
+    if (kRunScaleUp) {
+        std::mt19937 gb(1337);
+        Gpt big_model(big, d.vocab, gb);
+        const TrainResult br = train(big_model, d, big.batch, big.block, big.lr,
+            kIters, kReportEvery, gb);
+        printf("  train %.4f  val %.4f  (%.1fs)   the video reads ~%.2f\n",
+            br.train_loss, br.val_loss, br.seconds, kVideoBigGpt);
+
+        std::mt19937 gbs(1337);
+        printf("---\n%s\n---\n", d.decode(big_model.generate(2000, gbs)).c_str());
+    }
+    std::cout << "\n";
 }
