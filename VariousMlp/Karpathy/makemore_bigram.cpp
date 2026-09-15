@@ -42,6 +42,12 @@ constexpr int kVocab = 27;   // '.' plus the 26 lowercase letters
 // Anything outside '.' and a-z lands outside [0, kVocab) and indexes off the
 // end of the 27x27 arrays, so it is worth a compare per character. load_names
 // filters the dataset up front; this is the backstop for hand-written probes.
+//
+// Python:
+//   chars = sorted(list(set(''.join(words))))
+//   stoi = {s: i + 1 for i, s in enumerate(chars)}
+//   stoi['.'] = 0
+//   itos = {i: s for s, i in stoi.items()}
 inline int encode(char c) {
     CHECK(c == '.' || (c >= 'a' && c <= 'z'),
         "expected '.' or a-z, got '" << c << "' (byte "
@@ -54,6 +60,7 @@ inline char decode(int i) {
     return i == 0 ? '.' : static_cast<char>('a' + i - 1);
 }
 
+// Python: words = open('names.txt', 'r').read().splitlines()
 std::vector<std::string> load_names() {
     // Relative to a few plausible working directories: Visual Studio runs with
     // cwd = $(ProjectDir), a bare exe run has cwd = x64\Debug, and running from
@@ -95,7 +102,12 @@ std::vector<std::string> load_names() {
     return {};
 }
 
-// Python: chs = ['.'] + list(w) + ['.']; zip(chs, chs[1:])
+// Python:
+//   chs = ['.'] + list(w) + ['.']
+//   for ch1, ch2 in zip(chs, chs[1:]):
+//       ix1 = stoi[ch1]
+//       ix2 = stoi[ch2]
+//
 // Walking with a 'prev' index is the same traversal without materialising the
 // padded list on every word.
 template <class F>
@@ -113,6 +125,11 @@ void for_each_bigram(const std::string& w, F&& f) {
 // 1. Counting
 // ---------------------------------------------------------------------------
 
+// Python:
+//   N = torch.zeros((27, 27), dtype=torch.int32)
+//   for w in words:
+//       ...
+//           N[ix1, ix2] += 1
 std::vector<int> count_bigrams(const std::vector<std::string>& words) {
     std::vector<int> N(kVocab * kVocab, 0);
     for (const auto& w : words) {
@@ -123,6 +140,7 @@ std::vector<int> count_bigrams(const std::vector<std::string>& words) {
     return N;
 }
 
+// Python: sorted(b.items(), key=lambda kv: -kv[1])
 void print_top_bigrams(const std::vector<int>& N, int k) {
     CHECK(N.size() == kVocab * kVocab, "expected a " << kVocab << "x" << kVocab
         << " count matrix, got " << N.size() << " entries");
@@ -144,6 +162,16 @@ void print_top_bigrams(const std::vector<int>& N, int k) {
 }
 
 // The ASCII stand-in for the video's plt.imshow of the count matrix.
+//
+// Python:
+//   plt.figure(figsize=(16, 16))
+//   plt.imshow(N, cmap='Blues')
+//   for i in range(27):
+//       for j in range(27):
+//           chstr = itos[i] + itos[j]
+//           plt.text(j, i, chstr, ha="center", va="bottom", color='gray')
+//           plt.text(j, i, N[i, j].item(), ha="center", va="top", color='gray')
+//   plt.axis('off')
 void print_count_matrix(const std::vector<int>& N) {
     printf("  the 27x27 count matrix (rows = first char, cols = second):\n   ");
     for (int j = 0; j < kVocab; ++j) printf("%5c", decode(j));
@@ -172,6 +200,10 @@ void check_rows_sum_to_one(const std::vector<double>& P, const char* what) {
 
 // P = (N + smoothing) normalised per row. smoothing=0 is the raw model,
 // smoothing=1 is the video's "model smoothing" that kills the infinities.
+//
+// Python:
+//   P = (N + 1).float()
+//   P /= P.sum(1, keepdims=True)
 std::vector<double> row_normalise(const std::vector<int>& N, double smoothing) {
     CHECK(N.size() == kVocab * kVocab, "expected a " << kVocab << "x" << kVocab
         << " count matrix, got " << N.size() << " entries");
@@ -203,6 +235,16 @@ std::vector<double> row_normalise(const std::vector<int>& N, double smoothing) {
 
 // torch.multinomial on one row. discrete_distribution normalises internally,
 // so the row's weights can be counts or probabilities.
+//
+// Python:
+//   out = []
+//   ix = 0
+//   while True:
+//       p = P[ix]
+//       ix = torch.multinomial(p, num_samples=1, replacement=True, generator=g).item()
+//       out.append(itos[ix])
+//       if ix == 0:
+//           break
 std::string sample_name(const std::vector<double>& P, std::mt19937& g) {
     CHECK(P.size() == kVocab * kVocab, "expected a " << kVocab << "x" << kVocab
         << " probability matrix, got " << P.size() << " entries");
@@ -237,6 +279,16 @@ std::string sample_name(const std::vector<double>& P, std::mt19937& g) {
 // 3. Evaluation: average negative log likelihood, in nats
 // ---------------------------------------------------------------------------
 
+// Python:
+//   log_likelihood = 0.0
+//   n = 0
+//   for w in words:
+//       ...
+//           prob = P[ix1, ix2]
+//           log_likelihood += torch.log(prob)
+//           n += 1
+//   nll = -log_likelihood
+//   print(f'{nll / n}')
 double average_nll(const std::vector<std::string>& words,
     const std::vector<double>& P,
     long long* bigrams_out = nullptr) {
@@ -277,6 +329,10 @@ double average_nll(const std::vector<std::string>& words,
 
 // Softmax over one row of kVocab logits. Subtracting the row max first costs
 // nothing and keeps exp() away from overflow; softmax is invariant to it.
+//
+// Python:
+//   counts = logits.exp()
+//   probs = counts / counts.sum(1, keepdims=True)
 void softmax(const double* logits, double* probs) {
     const double maxl = *std::max_element(logits, logits + kVocab);
     double denom = 0.0;
@@ -349,6 +405,10 @@ public:
     // The logits for a one-hot input, one per neuron. Unchecked on purpose:
     // this is the inner loop, and validate_examples has already established
     // that every x and y in the training set indexes a real row.
+    //
+    // Python:
+    //   xenc = F.one_hot(xs, num_classes=27).float()
+    //   logits = xenc @ W
     const double* logits(int input) const {
         return &w_[input * kNeurons];
     }
@@ -382,6 +442,7 @@ public:
         }
     }
 
+    // Python: W.data += -50 * W.grad
     void step(double lr) {
         for (int k = 0; k < kParameters; ++k) {
             w_[k] -= lr * dw_[k];
@@ -410,6 +471,8 @@ private:
 // probs - onehot(target). That is what loss.backward() derives in the video,
 // and writing it by hand is what keeps this file independent of the micrograd
 // engine - 228k examples x 27 classes would be ~14M Value nodes per step.
+//
+// Python: loss = -probs[torch.arange(num), ys].log().mean()
 double softmax_cross_entropy(const double* logits, int target, double scale,
     double* dlogits) {
     double probs[kVocab];
@@ -467,6 +530,16 @@ void train_neural_net(const std::vector<std::string>& words, double count_model_
     // That is how language models normally store their data, and it is
     // deliberately not done here: two named arrays match the video, and the
     // duplicate copy costs under a megabyte.
+    //
+    // Python:
+    //   xs, ys = [], []
+    //   for w in words:
+    //       ...
+    //           xs.append(ix1)
+    //           ys.append(ix2)
+    //   xs = torch.tensor(xs)
+    //   ys = torch.tensor(ys)
+    //   num = xs.nelement()
     std::vector<int> xs, ys;
     for (const auto& w : words) {
         for_each_bigram(w, [&](int a, int b) {
@@ -496,6 +569,16 @@ void train_neural_net(const std::vector<std::string>& words, double count_model_
 
     const auto t0 = std::chrono::steady_clock::now();
 
+    // Python:
+    //   for k in range(100):
+    //       xenc = F.one_hot(xs, num_classes=27).float()
+    //       logits = xenc @ W
+    //       counts = logits.exp()
+    //       probs = counts / counts.sum(1, keepdims=True)
+    //       loss = -probs[torch.arange(num), ys].log().mean() + 0.01 * (W**2).mean()
+    //       W.grad = None
+    //       loss.backward()
+    //       W.data += -50 * W.grad
     for (int step = 0; step < steps; ++step) {
         layer.zero_grad();
 
@@ -574,6 +657,10 @@ void test_makemore() {
         return;
     }
 
+    // Python:
+    //   len(words)
+    //   min(len(w) for w in words)
+    //   max(len(w) for w in words)
     size_t shortest = words[0].size(), longest = 0;
     for (const auto& w : words) {
         shortest = std::min(shortest, w.size());
@@ -619,6 +706,8 @@ void test_makemore() {
 
     // For contrast, the video first samples from a uniform model to show what
     // "untrained" looks like.
+    //
+    // Python: p = torch.ones(27) / 27.0
     const std::vector<double> uniform(kVocab * kVocab, 1.0 / kVocab);
     std::cout << "  uniform model:  ";
     for (int i = 0; i < 5; ++i)

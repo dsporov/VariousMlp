@@ -49,6 +49,12 @@ constexpr int kBlock = 3;     // characters of context the model gets to see
 // encode, decode and load_names are deliberately a copy of the ones in
 // makemore_bigram.cpp rather than a shared header: each video's file is meant
 // to be read start to finish on its own, the way each video is watched.
+//
+// Python:
+//   chars = sorted(list(set(''.join(words))))
+//   stoi = {s: i + 1 for i, s in enumerate(chars)}
+//   stoi['.'] = 0
+//   itos = {i: s for s, i in stoi.items()}
 inline int encode(char c) {
     CHECK(c == '.' || (c >= 'a' && c <= 'z'),
         "expected '.' or a-z, got '" << c << "' (byte "
@@ -61,6 +67,7 @@ inline char decode(int i) {
     return i == 0 ? '.' : static_cast<char>('a' + i - 1);
 }
 
+// Python: words = open('names.txt', 'r').read().splitlines()
 std::vector<std::string> load_names() {
     // Relative to a few plausible working directories: Visual Studio runs with
     // cwd = $(ProjectDir), a bare exe run has cwd = x64\Debug, and running from
@@ -123,6 +130,18 @@ struct Dataset {
 // The video's build_dataset: slide a window of kBlock characters across each
 // name, starting from '...' and ending on the '.' that terminates it. A short
 // name is not a special case, it simply keeps more of the padding.
+//
+// Python:
+//   def build_dataset(words):
+//       X, Y = [], []
+//       for w in words:
+//           context = [0] * block_size
+//           for ch in w + '.':
+//               ix = stoi[ch]
+//               X.append(context)
+//               Y.append(ix)
+//               context = context[1:] + [ix]   # crop and append
+//       return torch.tensor(X), torch.tensor(Y)
 Dataset build_dataset(const std::vector<std::string>& words) {
     Dataset d;
     auto emit = [&](const int* ctx, int next) {
@@ -146,6 +165,9 @@ Dataset build_dataset(const std::vector<std::string>& words) {
     return d;
 }
 
+// Python:
+//   for x, y in zip(X[:n], Y[:n]):
+//       print(''.join(itos[i.item()] for i in x), '--->', itos[y.item()])
 void print_examples(const Dataset& d, size_t n) {
     for (size_t i = 0; i < std::min(n, d.size()); ++i) {
         const int* ctx = d.context(i);
@@ -185,6 +207,15 @@ void validate_dataset(const Dataset& d, const char* what) {
 // Splitting by name rather than by example is the point: every example cut
 // from one name shares its letters, so scattering them across the splits would
 // let the model meet the dev set during training.
+//
+// Python:
+//   random.seed(42)
+//   random.shuffle(words)
+//   n1 = int(0.8 * len(words))
+//   n2 = int(0.9 * len(words))
+//   Xtr,  Ytr  = build_dataset(words[:n1])
+//   Xdev, Ydev = build_dataset(words[n1:n2])
+//   Xte,  Yte  = build_dataset(words[n2:])
 
 struct Splits {
     std::vector<std::string> train, dev, test;
@@ -209,12 +240,15 @@ Splits split_words(std::vector<std::string> words, std::mt19937& g) {
 // The network
 // ---------------------------------------------------------------------------
 //
-// Bengio et al. 2003, exactly as the video assembles it:
+// Bengio et al. 2003, exactly as the video assembles it. Torch does a whole
+// batch at once, so every shape below leads with N; the C++ runs one example at
+// a time, which is the same arithmetic with N = 1.
 //
-//   emb    = concat(C[x0], C[x1], C[x2])      kBlock * embed numbers
-//   hidden = tanh(emb @ W1 + b1)              hidden units
-//   logits = hidden @ W2 + b2                 kVocab scores
-//   loss   = cross_entropy(logits, y)
+// Python:
+//   emb = C[X]                                   # (N, kBlock, embed)
+//   h = torch.tanh(emb.view(-1, 30) @ W1 + b1)   # (N, hidden); 30 = kBlock * embed
+//   logits = h @ W2 + b2                         # (N, kVocab)
+//   loss = F.cross_entropy(logits, Y)
 //
 // C is a lookup table, not a matrix multiply. The video spends a while on
 // one_hot(x) @ C before pointing out that it only ever selects a row - the
@@ -222,6 +256,8 @@ Splits split_words(std::vector<std::string> words, std::mt19937& g) {
 
 // Softmax over one row of kVocab logits. Subtracting the row max first costs
 // nothing and keeps exp() away from overflow; softmax is invariant to it.
+//
+// Python: probs = F.softmax(logits, dim=1)
 void softmax(const double* logits, double* probs) {
     const double maxl = *std::max_element(logits, logits + kVocab);
     double denom = 0.0;
@@ -251,7 +287,14 @@ public:
         CHECK(embed > 0 && hidden > 0, "embedding " << embed << " x hidden "
             << hidden << ": both have to be positive");
 
-        // C = torch.randn((27, n_embd)), and the same for every other tensor.
+        // Python:
+        //   C  = torch.randn((27, n_embd), generator=g)
+        //   W1 = torch.randn((block_size * n_embd, n_hidden), generator=g)
+        //   b1 = torch.randn(n_hidden, generator=g)
+        //   W2 = torch.randn((n_hidden, 27), generator=g)
+        //   b2 = torch.randn(27, generator=g)
+        //   parameters = [C, W1, b1, W2, b2]
+        //
         // Nothing here is scaled by fan-in, which leaves tanh saturated and the
         // starting loss absurdly high - that is the next video's subject, and
         // section 4 prints the evidence for it before training starts.
@@ -272,6 +315,7 @@ public:
     int embed() const { return embed_; }
     int hidden() const { return hidden_; }
     int inputs() const { return kBlock * embed_; }   // width of the concatenation
+    // Python: sum(p.nelement() for p in parameters)
     size_t parameters() const {
         return C_.size() + W1_.size() + b1_.size() + W2_.size() + b2_.size();
     }
@@ -297,6 +341,11 @@ public:
     // The forward pass for one example. Unchecked on purpose: validate_dataset
     // has already established that every token indexes a real row of C, and
     // this runs kBatch times per step for hundreds of thousands of steps.
+    //
+    // Python:
+    //   emb = C[X]
+    //   h = torch.tanh(emb.view(-1, 30) @ W1 + b1)
+    //   logits = h @ W2 + b2
     void forward(const int* ctx, Scratch& s) const {
         for (int j = 0; j < kBlock; ++j) {
             const double* row = &C_[ctx[j] * embed_];
@@ -325,6 +374,7 @@ public:
         }
     }
 
+    // Python: loss = F.cross_entropy(logits, Y)
     double loss(const int* ctx, int target, Scratch& s) const {
         forward(ctx, s);
         softmax(s.logits.data(), s.probs.data());
@@ -388,12 +438,18 @@ public:
         return -std::log(s.probs[target]);
     }
 
+    // Python:
+    //   for p in parameters:
+    //       p.grad = None
     void zero_grad() {
         for (std::vector<double>* p : { &dC_, &dW1_, &db1_, &dW2_, &db2_ }) {
             std::fill(p->begin(), p->end(), 0.0);
         }
     }
 
+    // Python:
+    //   for p in parameters:
+    //       p.data += -lr * p.grad
     void step(double lr) {
         descend(C_, dC_, lr);
         descend(W1_, dW1_, lr);
@@ -404,6 +460,12 @@ public:
 
     // Mean negative log likelihood over a whole split, in nats - the number
     // the video quotes for train and dev.
+    //
+    // Python:
+    //   emb = C[Xdev]
+    //   h = torch.tanh(emb.view(-1, 30) @ W1 + b1)
+    //   logits = h @ W2 + b2
+    //   loss = F.cross_entropy(logits, Ydev)
     double evaluate(const Dataset& d) const {
         CHECK(d.size() > 0, "nothing to evaluate");
 
@@ -415,6 +477,18 @@ public:
         return total / static_cast<double>(d.size());
     }
 
+    // Python:
+    //   context = [0] * block_size
+    //   while True:
+    //       emb = C[torch.tensor([context])]
+    //       h = torch.tanh(emb.view(1, -1) @ W1 + b1)
+    //       logits = h @ W2 + b2
+    //       probs = F.softmax(logits, dim=1)
+    //       ix = torch.multinomial(probs, num_samples=1, generator=g).item()
+    //       context = context[1:] + [ix]
+    //       out.append(ix)
+    //       if ix == 0:
+    //           break
     std::string sample(std::mt19937& g) const {
         // A model that never emits '.' would loop forever. The longest name in
         // the dataset is 15 characters, so this can only mean something broke.
@@ -472,6 +546,21 @@ struct TrainConfig {
 // Minibatch SGD, the other half of what makes this model tractable: 32
 // examples give a gradient that points roughly the right way, and taking far
 // more approximate steps beats taking a few exact ones.
+//
+// Python:
+//   for i in range(200000):
+//       ix = torch.randint(0, Xtr.shape[0], (32,))
+//       emb = C[Xtr[ix]]
+//       h = torch.tanh(emb.view(-1, 30) @ W1 + b1)
+//       logits = h @ W2 + b2
+//       loss = F.cross_entropy(logits, Ytr[ix])
+//       for p in parameters:
+//           p.grad = None
+//       loss.backward()
+//       lr = 0.1 if i < 100000 else 0.01
+//       for p in parameters:
+//           p.data += -lr * p.grad
+//       lossi.append(loss.item())
 void train(Mlp& net, const Dataset& data, const TrainConfig& cfg, std::mt19937& g) {
     CHECK(cfg.steps > 0 && cfg.batch > 0,
         "asked for " << cfg.steps << " steps of batch " << cfg.batch);
@@ -521,6 +610,15 @@ void train(Mlp& net, const Dataset& data, const TrainConfig& cfg, std::mt19937& 
 // for where the loss stops falling and starts climbing again. Karpathy reads
 // ~0.1 off the resulting plot; the bars below are that plot, one row per
 // bucket of steps.
+//
+// Python:
+//   lre = torch.linspace(-3, 0, 1000)
+//   lrs = 10**lre
+//   ...
+//       lr = lrs[i]
+//       lri.append(lre[i])
+//       lossi.append(loss.item())
+//   plt.plot(lri, lossi)
 void find_learning_rate(const Dataset& data, int embed, int hidden, int batch,
     std::mt19937& g) {
     constexpr int kSweepSteps = 1000;
@@ -599,6 +697,14 @@ void find_learning_rate(const Dataset& data, int embed, int hidden, int batch,
 // The payoff of a 2-dimensional embedding: printed as a scatter plot, the
 // vowels have gathered in one region and the rare characters have been flung
 // out to the edges. Nobody told the network that vowels are a category.
+//
+// Python:
+//   plt.figure(figsize=(8, 8))
+//   plt.scatter(C[:, 0].data, C[:, 1].data, s=200)
+//   for i in range(C.shape[0]):
+//       plt.text(C[i, 0].item(), C[i, 1].item(), itos[i],
+//                ha="center", va="center", color='white')
+//   plt.grid('minor')
 void print_embedding_scatter(const Mlp& net) {
     CHECK(net.embed() == 2,
         "the scatter plot needs a 2-dimensional embedding, got " << net.embed());
