@@ -38,7 +38,9 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <iostream>
 #include <limits>
@@ -86,12 +88,25 @@ using real = double;
 // Unlike the makemore files there is no fixed alphabet to do arithmetic on, so
 // the two maps get built for real. 256 entries is a table rather than a hash
 // map because the corpus is ASCII.
+// Any plain text file works: the vocabulary is whichever distinct bytes turn up
+// in it. Point this at War and Peace and the model trains on War and Peace. The
+// two things to know are that every sanity::Expect below is pinned to tiny
+// Shakespeare and will report a mismatch for anything else (which is what
+// Expect is for), and that the tokens are bytes rather than characters - so a
+// UTF-8 corpus in a non-Latin script gives the model half a letter at a time.
+constexpr const char* kCorpus = "input.txt";
+
 struct Data {
     std::vector<int> train;
     std::vector<int> val;
     std::vector<char> itos;
     int stoi[256];
     int vocab = 0;
+
+    // The directory input.txt came from. Checkpoints go there too, so that a
+    // run from Visual Studio and a run of the bare exe - which have different
+    // working directories - find each other's work.
+    std::string dir;
 
     char decode(int i) const {
         CHECK(i >= 0 && i < vocab, "token " << i << " is outside the vocabulary");
@@ -108,19 +123,38 @@ struct Data {
     }
 };
 
-bool load_shakespeare(Data& d) {
+// The vocabulary can hold any byte, so anything outside printable ASCII is
+// shown as an escape rather than sent to the console as-is.
+std::string printable(char c) {
+    if (c == '\n') {
+        return "\\n";
+    }
+    if (c == '\t') {
+        return "\\t";
+    }
+    const unsigned char b = static_cast<unsigned char>(c);
+    if (b >= 32 && b < 127) {
+        return std::string(1, c);
+    }
+    char buf[8];
+    std::snprintf(buf, sizeof(buf), "\\x%02x", b);
+    return std::string(buf);
+}
+
+bool load_corpus(Data& d) {
     // Relative to a few plausible working directories: Visual Studio runs with
     // cwd = $(ProjectDir), a bare exe run has cwd = x64\Debug, and running from
     // the repo root is the other common case.
-    static const char* kCandidates[] = {
-        "Karpathy/input.txt",
-        "input.txt",
-        "VariousMlp/Karpathy/input.txt",
-        "../../VariousMlp/Karpathy/input.txt",
+    static const char* kDirs[] = {
+        "Karpathy/",
+        "",
+        "VariousMlp/Karpathy/",
+        "../../VariousMlp/Karpathy/",
     };
 
     std::string text;
-    for (const char* path : kCandidates) {
+    for (const char* dir : kDirs) {
+        const std::string path = std::string(dir) + kCorpus;
         std::ifstream f(path, std::ios::binary);
         if (!f) {
             continue;
@@ -128,7 +162,8 @@ bool load_shakespeare(Data& d) {
         text.assign(std::istreambuf_iterator<char>(f),
             std::istreambuf_iterator<char>());
         if (!text.empty()) {
-            printf("  loaded %zu characters from %s\n", text.size(), path);
+            printf("  loaded %zu characters from %s\n", text.size(), path.c_str());
+            d.dir = dir;
             break;
         }
     }
@@ -1254,7 +1289,10 @@ public:
         set_training(false);
 
         std::vector<int> ids;
-        std::vector<int> ctx(1, 0);          // index 0 is '\n'
+        // Token 0 is the lowest byte value in the corpus, which for any text
+        // file containing a newline is '\n' - a blank line is as neutral a
+        // thing to start from as this vocabulary has.
+        std::vector<int> ctx(1, 0);
         std::vector<real> probs(static_cast<size_t>(vocab_));
         for (int i = 0; i < count; ++i) {
             const int T = static_cast<int>(std::min<size_t>(
@@ -1347,6 +1385,172 @@ private:
     std::vector<std::vector<real>> m_, v_;
     int t_ = 0;
 };
+
+// ---------------------------------------------------------------------------
+// Checkpoints
+// ---------------------------------------------------------------------------
+
+// Nine hours of training is not something to repeat because the program was
+// restarted. The format is deliberately self-describing: the header carries the
+// shape of the model and the size of its scalar, and every tensor carries its
+// own name and length, so a checkpoint belonging to a differently shaped model
+// is rejected rather than reinterpreted as noise.
+//
+// A missing or stale checkpoint is not an error - it means "train instead" - so
+// these report and return false rather than using CHECK. That is a third
+// severity beyond the two in check.h: not a broken program, not a number that
+// drifted, just a file that is not there or no longer fits.
+//
+// The bytes are raw doubles in native order. Both machines this runs on are
+// x86-64, so endianness is ignored; the sizeof(real) in the header and in the
+// filename is what stops a float build from reading a double build's file.
+
+constexpr char kCheckpointMagic[8] = { 'V', 'M', 'L', 'P', 'G', 'P', 'T', '2' };
+
+// FNV-1a over the vocabulary and the corpus length. The header already checks
+// the shape of the model, but shape is not identity: two corpora with the same
+// number of distinct characters would produce checkpoints with the same name
+// and a header that validates, and loading one onto the other gives a model
+// whose token 37 stands for a different letter. Nothing about that failure
+// looks like a failure - the losses are simply bad - so it is worth eight bytes
+// to make it impossible.
+std::uint64_t corpus_fingerprint(const Data& d) {
+    std::uint64_t h = 1469598103934665603ull;
+    auto mix = [&h](unsigned char b) {
+        h ^= b;
+        h *= 1099511628211ull;
+    };
+    for (char c : d.itos) {
+        mix(static_cast<unsigned char>(c));
+    }
+    const std::uint64_t n = d.train.size() + d.val.size();
+    for (int i = 0; i < 8; ++i) {
+        mix(static_cast<unsigned char>((n >> (i * 8)) & 0xffu));
+    }
+    return h;
+}
+
+template <class T>
+void write_pod(std::ostream& f, const T& v) {
+    f.write(reinterpret_cast<const char*>(&v), sizeof(T));
+}
+
+template <class T>
+bool read_pod(std::istream& f, T& v) {
+    return static_cast<bool>(f.read(reinterpret_cast<char*>(&v), sizeof(T)));
+}
+
+std::string checkpoint_name(const Config& cfg, const Data& d) {
+    char buf[160];
+    std::snprintf(buf, sizeof(buf), "gpt_c%d_h%d_l%d_t%d_v%d_r%d_%08x.ckpt",
+        cfg.n_embd, cfg.n_head, cfg.n_layer, cfg.block, d.vocab,
+        static_cast<int>(sizeof(real)),
+        static_cast<unsigned>(corpus_fingerprint(d) & 0xffffffffu));
+    return std::string(buf);
+}
+
+bool save_params(const std::vector<Param>& params, const Config& cfg,
+    const Data& d, const std::string& path) {
+    std::ofstream f(path, std::ios::binary);
+    if (!f) {
+        printf("  could not open %s for writing\n", path.c_str());
+        return false;
+    }
+
+    f.write(kCheckpointMagic, sizeof(kCheckpointMagic));
+    write_pod(f, static_cast<std::int32_t>(sizeof(real)));
+    write_pod(f, corpus_fingerprint(d));
+    write_pod(f, static_cast<std::int32_t>(d.vocab));
+    write_pod(f, static_cast<std::int32_t>(cfg.n_embd));
+    write_pod(f, static_cast<std::int32_t>(cfg.n_head));
+    write_pod(f, static_cast<std::int32_t>(cfg.n_layer));
+    write_pod(f, static_cast<std::int32_t>(cfg.block));
+    write_pod(f, static_cast<std::int32_t>(params.size()));
+
+    for (const Param& p : params) {
+        write_pod(f, static_cast<std::int32_t>(p.name.size()));
+        f.write(p.name.data(), static_cast<std::streamsize>(p.name.size()));
+        write_pod(f, static_cast<std::int64_t>(p.data->size()));
+        f.write(reinterpret_cast<const char*>(p.data->data()),
+            static_cast<std::streamsize>(p.data->size() * sizeof(real)));
+    }
+    return static_cast<bool>(f);
+}
+
+bool load_params(std::vector<Param>& params, const Config& cfg, const Data& d,
+    const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) {
+        return false;            // no checkpoint, so the caller trains
+    }
+
+    auto reject = [&path](const char* why) {
+        printf("  ignoring %s: %s\n", path.c_str(), why);
+        return false;
+    };
+
+    char magic[sizeof(kCheckpointMagic)];
+    if (!f.read(magic, sizeof(magic))
+        || std::memcmp(magic, kCheckpointMagic, sizeof(magic)) != 0) {
+        return reject("not a checkpoint written by this file");
+    }
+
+    std::int32_t scalar = 0, v = 0, embd = 0, head = 0, layer = 0, block = 0;
+    std::int32_t count = 0;
+    std::uint64_t fingerprint = 0;
+    if (!read_pod(f, scalar) || !read_pod(f, fingerprint) || !read_pod(f, v)
+        || !read_pod(f, embd) || !read_pod(f, head) || !read_pod(f, layer)
+        || !read_pod(f, block) || !read_pod(f, count)) {
+        return reject("the header is truncated");
+    }
+    if (scalar != static_cast<std::int32_t>(sizeof(real))) {
+        return reject("it was written with a different scalar type");
+    }
+    if (fingerprint != corpus_fingerprint(d)) {
+        return reject("it was trained on a different corpus");
+    }
+    if (v != d.vocab || embd != cfg.n_embd || head != cfg.n_head
+        || layer != cfg.n_layer || block != cfg.block) {
+        return reject("it was written for a differently shaped model");
+    }
+    if (count != static_cast<std::int32_t>(params.size())) {
+        return reject("it holds a different number of tensors");
+    }
+
+    // Read into a staging buffer first. A file that turns out to be truncated
+    // halfway through should leave the model as it was rather than half
+    // overwritten with one model's weights and half with another's. The cost is
+    // holding the parameters twice, which for the scaled-up model is 86MB.
+    std::vector<std::vector<real>> staged(params.size());
+    for (size_t i = 0; i < params.size(); ++i) {
+        std::int32_t len = 0;
+        if (!read_pod(f, len) || len < 0 || len > 256) {
+            return reject("a tensor name is malformed");
+        }
+        std::string name(static_cast<size_t>(len), '\0');
+        if (len > 0 && !f.read(&name[0], len)) {
+            return reject("a tensor name is truncated");
+        }
+        std::int64_t n = 0;
+        if (!read_pod(f, n) || n < 0) {
+            return reject("a tensor length is malformed");
+        }
+        if (name != params[i].name
+            || static_cast<size_t>(n) != params[i].data->size()) {
+            return reject("its tensors do not line up with this model's");
+        }
+        staged[i].resize(static_cast<size_t>(n));
+        if (n > 0 && !f.read(reinterpret_cast<char*>(staged[i].data()),
+            static_cast<std::streamsize>(n * static_cast<std::int64_t>(sizeof(real))))) {
+            return reject("it is truncated");
+        }
+    }
+
+    for (size_t i = 0; i < params.size(); ++i) {
+        *params[i].data = staged[i];
+    }
+    return true;
+}
 
 // ---------------------------------------------------------------------------
 // Training
@@ -1710,6 +1914,31 @@ double run_flops(const Config& cfg, size_t params, int vocab, int iters,
     return per_step * iters + per_step * evals / 3.0;
 }
 
+// Steps timed for the throughput figure in section 8. Enough to get past the
+// first-touch page faults and the turbo ramp, few enough to be unnoticeable.
+constexpr int kBenchSteps = 200;
+
+// Timed on a throwaway model rather than on the trained one, so the number
+// means the same thing whether section 6 trained or loaded a checkpoint - and
+// so that measuring never moves weights that matter.
+double measure_throughput(const Config& cfg, const Data& d, int vocab, int steps) {
+    std::mt19937 g(1337);
+    Gpt probe(cfg, vocab, g);
+    AdamW opt(probe.params(), cfg.lr);
+    std::vector<int> x, y;
+
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < steps; ++i) {
+        sample_batch(d.train, cfg.batch, cfg.block, x, y, g);
+        probe.zero_grad();
+        probe.forward_backward(x.data(), y.data(), cfg.batch, cfg.block);
+        opt.step();
+    }
+    const double secs = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - t0).count();
+    return step_flops(cfg, probe.parameter_count(), vocab) * steps / secs;
+}
+
 // What the layers hold between their forward and backward passes, which is
 // what actually decides whether a configuration fits in memory. Each block
 // keeps on the order of 32 (B, T, C) tensors once the feedforward's 4x hidden
@@ -1744,15 +1973,14 @@ constexpr real kVideoBigGpt = real(1.48);
 void test_gpt() {
     std::cout << "== 0. tiny shakespeare ==\n";
     Data d;
-    if (!load_shakespeare(d)) {
-        std::cout << "  could not find input.txt - expected it next to gpt.cpp "
-            "in Karpathy/\n";
+    if (!load_corpus(d)) {
+        printf("  could not find %s - expected it next to gpt.cpp in Karpathy/\n",
+            kCorpus);
         return;
     }
     printf("  vocabulary of %d characters: ", d.vocab);
     for (int i = 0; i < d.vocab; ++i) {
-        const char c = d.decode(i);
-        printf("%s", c == '\n' ? "\\n" : std::string(1, c).c_str());
+        printf("%s", printable(d.decode(i)).c_str());
     }
     printf("\n  train %zu tokens, val %zu tokens\n", d.train.size(), d.val.size());
 
@@ -1767,15 +1995,17 @@ void test_gpt() {
         for (int t = 0; t < kBlock; ++t) {
             std::string ctx;
             for (int u = 0; u <= t; ++u) {
-                const char c = d.decode(x[static_cast<size_t>(u)]);
-                ctx += (c == '\n') ? std::string("\\n") : std::string(1, c);
+                ctx += printable(d.decode(x[static_cast<size_t>(u)]));
             }
-            const char nx = d.decode(y[static_cast<size_t>(t)]);
             printf("    %-20s ---> %s\n", ctx.c_str(),
-                nx == '\n' ? "\\n" : std::string(1, nx).c_str());
+                printable(d.decode(y[static_cast<size_t>(t)])).c_str());
         }
     }
 
+    // Pinned to tiny Shakespeare, which means pinned to the file rather than to
+    // the program. Point kCorpus at anything else and these report a mismatch
+    // and carry on, which is exactly what Expect is for - as do the loss checks
+    // further down, since the video's numbers are numbers about this text.
     sanity::Expect data;
     data.equal("characters", static_cast<double>(d.train.size() + d.val.size()), 1115394);
     data.equal("vocabulary", static_cast<double>(d.vocab), 65);
@@ -1849,11 +2079,28 @@ void test_gpt() {
     std::mt19937 g6(1337);
     const Config cfg{ kEmbed, kHeads, kLayers, kBlock, kBatch, kDropout, kLr };
     Gpt model(cfg, d.vocab, g6);
-    printf("  %zu parameters, %d steps - this is the slow part\n",
-        model.parameter_count(), kIters);
+    printf("  %zu parameters\n", model.parameter_count());
 
-    const TrainResult r = train(model, d, kBatch, kBlock, kLr, kIters, kReportEvery, g6);
-    printf("  train %.4f  val %.4f  (%.1fs)\n", r.train_loss, r.val_loss, r.seconds);
+    const std::string ckpt = d.dir + checkpoint_name(cfg, d);
+    TrainResult r;
+    const bool loaded = load_params(model.params(), cfg, d, ckpt);
+    if (loaded) {
+        const Losses l = estimate_loss(model, d, kBatch, kBlock);
+        r.train_loss = l.train;
+        r.val_loss = l.val;
+        printf("  loaded %s, so no training was needed\n", ckpt.c_str());
+        printf("  train %.4f  val %.4f\n", r.train_loss, r.val_loss);
+    }
+    else {
+        printf("  no checkpoint beside the data, so %d steps of training - "
+            "this is the slow part\n", kIters);
+        r = train(model, d, kBatch, kBlock, kLr, kIters, kReportEvery, g6);
+        printf("  train %.4f  val %.4f  (%.1fs)\n",
+            r.train_loss, r.val_loss, r.seconds);
+        if (save_params(model.params(), cfg, d, ckpt)) {
+            printf("  saved to %s - delete it to train again\n", ckpt.c_str());
+        }
+    }
     printf("  the video reads ~%.2f train / ~%.2f val here, and ~%.2f val after "
         "scaling to\n  %d channels / %d heads / %d blocks / context %d\n",
         kVideoSmallTrain, kVideoSmallGpt, kVideoBigGpt,
@@ -1862,7 +2109,11 @@ void test_gpt() {
         "from here\n", r.val_loss - r.train_loss);
 
     sanity::Expect chk;
-    chk.close("loss before training", r.first_loss, kUniformLoss, 0.6);
+    // Only meaningful when this run did the training; a loaded model has no
+    // step 0 to have scored.
+    if (!loaded) {
+        chk.close("loss before training", r.first_loss, kUniformLoss, 0.6);
+    }
     chk.that("the transformer beats the bigram baseline",
         r.val_loss < bigram_result.val_loss);
     // Not all of this gap is memorisation. The split is positional - the
@@ -1907,13 +2158,13 @@ void test_gpt() {
         big_params = probe.parameter_count();
     }
 
-    const double measured = run_flops(cfg, model.parameter_count(), d.vocab,
-        kIters, kReportEvery) / r.seconds;
+    const double measured = measure_throughput(cfg, d, d.vocab, kBenchSteps);
     const double projected = run_flops(big, big_params, d.vocab, kIters, kReportEvery);
     const double bytes = activation_bytes(big);
 
     printf("  %zu parameters (the video reads 10.788929 M)\n", big_params);
-    printf("  section 6 ran at %.2f GFLOP/s on this machine\n", measured / 1e9);
+    printf("  this machine runs the small model at %.2f GFLOP/s "
+        "(timed over %d steps)\n", measured / 1e9, kBenchSteps);
     printf("  one step of the scaled-up model is %.2f TFLOP, so %d steps is "
         "%.1f days\n", step_flops(big, big_params, d.vocab) / 1e12, kIters,
         projected / measured / 86400.0);
@@ -1934,10 +2185,25 @@ void test_gpt() {
     if (kRunScaleUp) {
         std::mt19937 gb(1337);
         Gpt big_model(big, d.vocab, gb);
-        const TrainResult br = train(big_model, d, big.batch, big.block, big.lr,
-            kIters, kReportEvery, gb);
-        printf("  train %.4f  val %.4f  (%.1fs)   the video reads ~%.2f\n",
-            br.train_loss, br.val_loss, br.seconds, kVideoBigGpt);
+
+        // The whole reason checkpoints exist: this branch is an overnight run
+        // once, and a second or two every time after.
+        const std::string bckpt = d.dir + checkpoint_name(big, d);
+        if (load_params(big_model.params(), big, d, bckpt)) {
+            const Losses l = estimate_loss(big_model, d, big.batch, big.block);
+            printf("  loaded %s\n  train %.4f  val %.4f   "
+                "the video reads ~%.2f\n",
+                bckpt.c_str(), l.train, l.val, kVideoBigGpt);
+        }
+        else {
+            const TrainResult br = train(big_model, d, big.batch, big.block,
+                big.lr, kIters, kReportEvery, gb);
+            printf("  train %.4f  val %.4f  (%.1fs)   the video reads ~%.2f\n",
+                br.train_loss, br.val_loss, br.seconds, kVideoBigGpt);
+            if (save_params(big_model.params(), big, d, bckpt)) {
+                printf("  saved to %s\n", bckpt.c_str());
+            }
+        }
 
         std::mt19937 gbs(1337);
         printf("---\n%s\n---\n", d.decode(big_model.generate(2000, gbs)).c_str());
