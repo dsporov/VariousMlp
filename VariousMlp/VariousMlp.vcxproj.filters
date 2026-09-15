@@ -33,6 +33,9 @@
     <ClCompile Include="Karpathy\makemore_batchnorm.cpp">
       <Filter>Karpathy</Filter>
     </ClCompile>
+    <ClCompile Include="Karpathy\gpt.cpp">
+      <Filter>Karpathy</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Karpathy\check.h">
