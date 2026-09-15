@@ -364,16 +364,22 @@ public:
 
     // The video's 0.01 * (W**2).mean(): gravity pulling every weight toward
     // zero, which is what add-one smoothing on the counts looks like from the
-    // gradient-descent side. Folds the penalty's gradient in and returns the
-    // penalty itself, so the caller can report the loss it was trained on.
-    double add_l2_penalty(double reg) {
-        const double scale = 1.0 / kParameters;
+    // gradient-descent side. Split in two so the reported number and the
+    // gradient stay independently readable; both loops are over 27x27 weights,
+    // which is nothing next to the pass over the examples.
+    double l2_penalty(double reg) const {
         double sq = 0.0;
         for (int k = 0; k < kParameters; ++k) {
             sq += w_[k] * w_[k];
-            dw_[k] += reg * 2.0 * w_[k] * scale;
         }
-        return reg * sq * scale;
+        return reg * sq / kParameters;
+    }
+
+    void add_l2_grad(double reg) {
+        const double scale = reg * 2.0 / kParameters;
+        for (int k = 0; k < kParameters; ++k) {
+            dw_[k] += scale * w_[k];
+        }
     }
 
     void step(double lr) {
@@ -503,7 +509,9 @@ void train_neural_net(const std::vector<std::string>& words, double count_model_
             double* dlogits = layer.dlogits(x);
             loss += softmax_cross_entropy(logits, ys[i], inv_n, dlogits);
         }
-        loss = loss * inv_n + layer.add_l2_penalty(reg);
+        // L2 regularisation as a tunable knob rather than a hand-picked smoothing constant
+        layer.add_l2_grad(reg);
+        loss = loss * inv_n + layer.l2_penalty(reg);
 
         layer.step(lr);
 
