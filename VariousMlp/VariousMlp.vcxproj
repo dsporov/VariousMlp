@@ -123,6 +123,7 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="Karpathy\makemore_batchnorm.cpp" />
     <ClCompile Include="Karpathy\makemore_bigram.cpp" />
     <ClCompile Include="Karpathy\makemore_mlp.cpp" />
     <ClCompile Include="Karpathy\micrograd.cpp" />
