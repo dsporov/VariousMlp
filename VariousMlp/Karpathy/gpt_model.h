@@ -42,6 +42,22 @@
 #define RESTRICT
 #endif
 
+// The loops below are threaded with OpenMP. Nothing here is guarded by an
+// #ifdef, because a compiler without it ignores the pragmas and every loop runs
+// exactly as it did when it was serial - which is also why the shape of each
+// loop had to survive being parallelised rather than being rewritten around the
+// threads.
+//
+// The project passes /openmp:llvm, whose runtime has the better scheduler and
+// the cheaper barrier. Nothing below needs it though: no collapse, no
+// reductions, no array sections, and every loop variable is a signed int, so
+// this is all inside OpenMP 2.0 and plain /openmp builds it too. That matters
+// because /openmp:llvm links libomp140.x86_64.dll while /openmp links the
+// vcomp140.dll that every machine with the VC redistributable already has.
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 // A named namespace rather than an anonymous one, because two translation units
 // have to agree on these types. Free functions below are inline for the same
 // reason.
@@ -52,6 +68,56 @@ namespace gpt {
 // not before it has to: gradient_check() leans on central differences being
 // good to about 1e-9, which is a property of double and not of float.
 using real = double;
+
+// Inside a parallel region these describe the team. Outside one - and in a
+// build with no OpenMP at all - they describe the single thread that is
+// running, which is what makes the serial path fall out of the same code.
+inline int thread_count() {
+#ifdef _OPENMP
+    return omp_get_num_threads();
+#else
+    return 1;
+#endif
+}
+
+inline int thread_index() {
+#ifdef _OPENMP
+    return omp_get_thread_num();
+#else
+    return 0;
+#endif
+}
+
+// What a large enough loop would actually get, which is what the cost model in
+// gpt.cpp wants to print alongside its throughput number.
+inline int available_threads() {
+#ifdef _OPENMP
+    return omp_get_max_threads();
+#else
+    return 1;
+#endif
+}
+
+// Handing a loop to a team of threads costs a few microseconds, so a loop needs
+// more than a few microseconds of work in it to come out ahead. Three shapes
+// occur below and they need different thresholds:
+//
+//   - a loop over the B*T rows of a tensor, where one iteration is a whole
+//     matrix row of arithmetic. A few dozen rows are already worth splitting.
+//   - a flat elementwise loop, where one iteration is a single multiply. These
+//     are memory-bound and need thousands of iterations before the fork pays
+//     for itself.
+//   - attention, counted in (batch, head, query, key) entries because its
+//     parallelism is over the heads while its work is over the square.
+//
+// The numbers are deliberately cautious, and at the video's small size several
+// loops fall under them and stay serial. That is the right answer rather than a
+// missed opportunity: 8192 elements split sixteen ways is 512 doubles a thread,
+// less work than the fork that handed them out. They are also the first thing
+// to tune if a profile disagrees.
+constexpr int kMinParallelRows = 32;
+constexpr int kMinParallelElems = 16384;
+constexpr long long kMinParallelWork = 16384;
 
 // ---------------------------------------------------------------------------
 // The data
@@ -235,6 +301,14 @@ struct Matrix {
     std::vector<real> v;
 
     void resize(int b, int t, int c) {
+        // The flat loops over v below index it with int, because OpenMP wants a
+        // signed loop variable and every other count in this file is an int
+        // already. That holds for anything this port trains - the video's final
+        // model peaks at 25M entries in a tensor - but it is a real ceiling,
+        // and one worth failing on rather than wrapping around at.
+        CHECK(static_cast<long long>(b) * t * c <= 2147483647LL,
+            "a " << b << "x" << t << "x" << c
+            << " tensor has more entries than an int can index");
         batch = b;
         time = t;
         cols = c;
@@ -336,6 +410,8 @@ public:
         x_ = &x;
         out_.resize(x.batch, x.time, fan_out_);
         const int n = x.rows();
+        // One row per iteration, and no other iteration touches that row.
+#pragma omp parallel for schedule(static) if(n >= kMinParallelRows)
         for (int i = 0; i < n; ++i) {
             const real* RESTRICT xi = x.row(i);
             real* RESTRICT oi = out_.row(i);
@@ -353,29 +429,68 @@ public:
         return out_;
     }
 
+    // Three passes where the serial version had one, because the three
+    // gradients this layer produces each want a different loop to be the
+    // parallel one.
+    //
+    // dx is per row and shares nothing. dW and db are sums over every row, so
+    // handing rows to threads would have all of them accumulating into the same
+    // weight. Giving each thread a private copy of dW to reduce afterwards
+    // would cost fan_in*fan_out doubles per thread - 4.7MB apiece at the
+    // video's final size - and would change the order the sum is taken in.
+    // Splitting dW by input channel costs neither: thread t owns whole rows of
+    // dW, so no two threads write the same cache line except at the one
+    // boundary between their ranges, and each row is still summed over the
+    // examples in ascending order by a single thread. All three passes produce
+    // bit for bit what the fused serial loop produced.
+    //
+    // What the split does cost is that dout is streamed three times instead of
+    // once. At the video's small size it sits in L2 throughout and this is
+    // free; at the scaled-up size it is real, and it is the same cache problem
+    // that blocking has to solve for the multiply itself.
     const Matrix& backward(const Matrix& dout) override {
         const Matrix& x = *x_;
         dx_.resize(x.batch, x.time, fan_in_);
         const int n = x.rows();
+
+#pragma omp parallel for schedule(static) if(n >= kMinParallelRows)
         for (int i = 0; i < n; ++i) {
+            // Distinct vectors: dout's storage and dx_'s.
             const real* RESTRICT di = dout.row(i);
-            const real* RESTRICT xi = x.row(i);
             real* RESTRICT dxi = dx_.row(i);
-            if (has_bias_) {
-                for (int j = 0; j < fan_out_; ++j) {
-                    db_[j] += di[j];
-                }
-            }
             for (int k = 0; k < fan_in_; ++k) {
                 const real* RESTRICT wk = &w_[static_cast<size_t>(k) * fan_out_];
-                real* RESTRICT dwk = &dw_[static_cast<size_t>(k) * fan_out_];
-                const real xk = xi[k];
                 real acc = 0;
                 for (int j = 0; j < fan_out_; ++j) {
-                    dwk[j] += xk * di[j];
                     acc += wk[j] * di[j];
                 }
                 dxi[k] = acc;
+            }
+        }
+
+#pragma omp parallel for schedule(static) if(n >= kMinParallelRows)
+        for (int k = 0; k < fan_in_; ++k) {
+            // dwk points into dw_, di into dout's storage.
+            real* RESTRICT dwk = &dw_[static_cast<size_t>(k) * fan_out_];
+            for (int i = 0; i < n; ++i) {
+                const real* RESTRICT di = dout.row(i);
+                const real xk = x.row(i)[k];
+                for (int j = 0; j < fan_out_; ++j) {
+                    dwk[j] += xk * di[j];
+                }
+            }
+        }
+
+        // db is a column sum, and it stays serial. It is one pass over dout
+        // against the fan_in passes above - a fraction of a percent of the work
+        // here - and splitting fan_out doubles across sixteen threads would put
+        // several of them on one cache line, which costs more than it saves.
+        if (has_bias_) {
+            for (int i = 0; i < n; ++i) {
+                const real* di = dout.row(i);
+                for (int j = 0; j < fan_out_; ++j) {
+                    db_[j] += di[j];
+                }
             }
         }
         return dx_;
@@ -433,6 +548,10 @@ public:
         invstd_.assign(static_cast<size_t>(n), real(0));
 
         const real inv_c = real(1) / dim_;
+        // A row normalises against its own channels and nothing else, which is
+        // the property that made LayerNorm the right choice here in the first
+        // place and now makes it trivially parallel.
+#pragma omp parallel for schedule(static) if(n >= kMinParallelRows)
         for (int i = 0; i < n; ++i) {
             const real* xi = x.row(i);
             real mean = 0;
@@ -473,6 +592,10 @@ public:
         dx_.resize(dout.batch, dout.time, dim_);
 
         const real inv_c = real(1) / dim_;
+        // dx first, one row per thread. The two parameter gradients come out of
+        // the same loop in the serial version, but they are sums over every
+        // row, so they have to leave it.
+#pragma omp parallel for schedule(static) if(n >= kMinParallelRows)
         for (int i = 0; i < n; ++i) {
             const real* RESTRICT di = dout.row(i);
             const real* RESTRICT xh = xhat_.row(i);
@@ -482,8 +605,6 @@ public:
             real sum_dx = 0;
             for (int j = 0; j < dim_; ++j) {
                 const real dxhat = di[j] * gamma_[j];
-                dgamma_[j] += di[j] * xh[j];
-                dbeta_[j] += di[j];
                 sum_d += dxhat;
                 sum_dx += dxhat * xh[j];
             }
@@ -493,6 +614,22 @@ public:
             for (int j = 0; j < dim_; ++j) {
                 const real dxhat = di[j] * gamma_[j];
                 dxi[j] = inv * (dxhat - mean_d - xh[j] * mean_dx);
+            }
+        }
+
+        // And the parameter gradients serially. Unlike the Linear layer above
+        // there is no second axis to split these along - there are dim_ of them
+        // and threads would land several to a cache line - and the arithmetic
+        // is a few tenths of a percent of what the Linear layers either side of
+        // this one are doing. Keeping it serial also keeps the summation order
+        // the one the serial build used, which is what makes the loss curve
+        // comparable across the two.
+        for (int i = 0; i < n; ++i) {
+            const real* di = dout.row(i);
+            const real* xh = xhat_.row(i);
+            for (int j = 0; j < dim_; ++j) {
+                dgamma_[j] += di[j] * xh[j];
+                dbeta_[j] += di[j];
             }
         }
         return dx_;
@@ -518,7 +655,9 @@ class ReLU : public Layer {
 public:
     const Matrix& forward(const Matrix& x) override {
         out_.resize(x.batch, x.time, x.cols);
-        for (size_t k = 0; k < x.v.size(); ++k) {
+        const int n = static_cast<int>(x.v.size());
+#pragma omp parallel for schedule(static) if(n >= kMinParallelElems)
+        for (int k = 0; k < n; ++k) {
             out_.v[k] = x.v[k] > real(0) ? x.v[k] : real(0);
         }
         return out_;
@@ -526,7 +665,9 @@ public:
 
     const Matrix& backward(const Matrix& dout) override {
         dx_.resize(out_.batch, out_.time, out_.cols);
-        for (size_t k = 0; k < dout.v.size(); ++k) {
+        const int n = static_cast<int>(dout.v.size());
+#pragma omp parallel for schedule(static) if(n >= kMinParallelElems)
+        for (int k = 0; k < n; ++k) {
             dx_.v[k] = out_.v[k] > real(0) ? dout.v[k] : real(0);
         }
         return dx_;
@@ -558,6 +699,11 @@ public:
         const real scale = real(1) / keep;
         out_.resize(x.batch, x.time, x.cols);
         mask_.assign(x.v.size(), real(0));
+        // Serial, and not for want of trying: the mask is drawn from one
+        // generator, so threads would both race on its state and draw a
+        // different mask on every run. A reproducible parallel dropout needs a
+        // counter-based generator keyed by element index, which is a different
+        // piece of work from this one.
         std::uniform_real_distribution<real> u(real(0), real(1));
         for (size_t k = 0; k < x.v.size(); ++k) {
             if (u(rng_) < keep) {
@@ -573,7 +719,9 @@ public:
             return dout;
         }
         dx_.resize(dout.batch, dout.time, dout.cols);
-        for (size_t k = 0; k < dout.v.size(); ++k) {
+        const int n = static_cast<int>(dout.v.size());
+#pragma omp parallel for schedule(static) if(n >= kMinParallelElems)
+        for (int k = 0; k < n; ++k) {
             dx_.v[k] = dout.v[k] * mask_[k];
         }
         return dx_;
@@ -669,44 +817,56 @@ public:
 
         // One row of att_ per (batch, head, query position), holding that
         // position's distribution over the keys it is allowed to see.
-        att_.resize(B * n_head_, T, T);
-        for (int b = 0; b < B; ++b) {
-            for (int h = 0; h < n_head_; ++h) {
-                const int bh = b * n_head_ + h;
-                for (int t = 0; t < T; ++t) {
-                    real* a = att_.row(bh, t);
-                    const real* qi = q.row(b, t) + h * hs_;
-                    for (int u = 0; u <= t; ++u) {
-                        const real* ki = k.row(b, u) + h * hs_;
-                        real s = 0;
-                        for (int dd = 0; dd < hs_; ++dd) {
-                            s += qi[dd] * ki[dd];
-                        }
-                        a[u] = s * scale;
+        //
+        // The batch and head loops are flattened into one so that OpenMP has a
+        // single index to hand out. (batch, head) is the axis to split on - not
+        // the query position - because the backward pass accumulates down the
+        // key axis and so cannot be split by t, and the two passes have to
+        // agree. Every (batch, head) does identical work, so a static schedule
+        // balances the team exactly.
+        const int bh_count = B * n_head_;
+        const long long attn_work = static_cast<long long>(bh_count) * T * T;
+
+        att_.resize(bh_count, T, T);
+#pragma omp parallel for schedule(static) if(attn_work >= kMinParallelWork)
+        for (int bh = 0; bh < bh_count; ++bh) {
+            const int b = bh / n_head_;
+            const int h = bh % n_head_;
+            for (int t = 0; t < T; ++t) {
+                real* a = att_.row(bh, t);
+                const real* qi = q.row(b, t) + h * hs_;
+                for (int u = 0; u <= t; ++u) {
+                    const real* ki = k.row(b, u) + h * hs_;
+                    real s = 0;
+                    for (int dd = 0; dd < hs_; ++dd) {
+                        s += qi[dd] * ki[dd];
                     }
-                    softmax_row(a, a, t + 1);
-                    for (int u = t + 1; u < T; ++u) {
-                        a[u] = real(0);        // the masked future
-                    }
+                    a[u] = s * scale;
+                }
+                softmax_row(a, a, t + 1);
+                for (int u = t + 1; u < T; ++u) {
+                    a[u] = real(0);        // the masked future
                 }
             }
         }
 
         const Matrix& a = attn_drop_.forward(att_);
 
+        // Head h writes channels [h*hs, (h+1)*hs) of heads_ and no others, so
+        // the threads never meet even though they share the tensor.
         heads_.resize(B, T, n_embd_);
-        for (int b = 0; b < B; ++b) {
-            for (int h = 0; h < n_head_; ++h) {
-                const int bh = b * n_head_ + h;
-                for (int t = 0; t < T; ++t) {
-                    const real* p = a.row(bh, t);
-                    real* o = heads_.row(b, t) + h * hs_;
-                    for (int u = 0; u <= t; ++u) {
-                        const real* vi = v.row(b, u) + h * hs_;
-                        const real w = p[u];
-                        for (int dd = 0; dd < hs_; ++dd) {
-                            o[dd] += w * vi[dd];
-                        }
+#pragma omp parallel for schedule(static) if(attn_work >= kMinParallelWork)
+        for (int bh = 0; bh < bh_count; ++bh) {
+            const int b = bh / n_head_;
+            const int h = bh % n_head_;
+            for (int t = 0; t < T; ++t) {
+                const real* p = a.row(bh, t);
+                real* o = heads_.row(b, t) + h * hs_;
+                for (int u = 0; u <= t; ++u) {
+                    const real* vi = v.row(b, u) + h * hs_;
+                    const real w = p[u];
+                    for (int dd = 0; dd < hs_; ++dd) {
+                        o[dd] += w * vi[dd];
                     }
                 }
             }
@@ -727,31 +887,40 @@ public:
         const Matrix& k = key_.out();
         const Matrix& v = value_.out();
 
-        da_.resize(B * n_head_, T, T);
+        const int bh_count = B * n_head_;
+        const long long attn_work = static_cast<long long>(bh_count) * T * T;
+
+        da_.resize(bh_count, T, T);
         dv_.resize(B, T, n_embd_);
         dq_.resize(B, T, n_embd_);
         dk_.resize(B, T, n_embd_);
 
         // out[b,t,h] = sum_{u<=t} a[b,h,t,u] * v[b,u,h], so the weights pick up
         // a dot product and the values pick up a weighted sum down the column.
-        for (int b = 0; b < B; ++b) {
-            for (int h = 0; h < n_head_; ++h) {
-                const int bh = b * n_head_ + h;
-                for (int t = 0; t < T; ++t) {
-                    const real* RESTRICT dO = dheads.row(b, t) + h * hs_;
-                    const real* RESTRICT p = a.row(bh, t);
-                    real* RESTRICT dA = da_.row(bh, t);
-                    for (int u = 0; u <= t; ++u) {
-                        const real* RESTRICT vi = v.row(b, u) + h * hs_;
-                        real* RESTRICT dvi = dv_.row(b, u) + h * hs_;
-                        real dot = 0;
-                        const real w = p[u];
-                        for (int dd = 0; dd < hs_; ++dd) {
-                            dot += dO[dd] * vi[dd];
-                            dvi[dd] += w * dO[dd];
-                        }
-                        dA[u] = dot;
+        //
+        // That column sum is why the query position cannot be the parallel
+        // axis: every t from u upwards adds into dv at u. Splitting by
+        // (batch, head) leaves it alone - thread bh owns batch b's channels
+        // [h*hs, (h+1)*hs) of dv outright, and still walks t in order, so the
+        // sums come out in the order the serial version produced them.
+#pragma omp parallel for schedule(static) if(attn_work >= kMinParallelWork)
+        for (int bh = 0; bh < bh_count; ++bh) {
+            const int b = bh / n_head_;
+            const int h = bh % n_head_;
+            for (int t = 0; t < T; ++t) {
+                const real* RESTRICT dO = dheads.row(b, t) + h * hs_;
+                const real* RESTRICT p = a.row(bh, t);
+                real* RESTRICT dA = da_.row(bh, t);
+                for (int u = 0; u <= t; ++u) {
+                    const real* RESTRICT vi = v.row(b, u) + h * hs_;
+                    real* RESTRICT dvi = dv_.row(b, u) + h * hs_;
+                    real dot = 0;
+                    const real w = p[u];
+                    for (int dd = 0; dd < hs_; ++dd) {
+                        dot += dO[dd] * vi[dd];
+                        dvi[dd] += w * dO[dd];
                     }
+                    dA[u] = dot;
                 }
             }
         }
@@ -761,40 +930,40 @@ public:
         // Softmax over a row: ds_u = p_u * (dp_u - sum_w p_w dp_w). The
         // subtracted term is the constraint that the row sums to one, so
         // pushing one weight up has to pull the others down.
-        ds_.resize(B * n_head_, T, T);
-        for (int b = 0; b < B; ++b) {
-            for (int h = 0; h < n_head_; ++h) {
-                const int bh = b * n_head_ + h;
-                for (int t = 0; t < T; ++t) {
-                    const real* p = att_.row(bh, t);
-                    const real* dpi = dp.row(bh, t);
-                    real* ds = ds_.row(bh, t);
-                    real dot = 0;
-                    for (int u = 0; u <= t; ++u) {
-                        dot += p[u] * dpi[u];
-                    }
-                    for (int u = 0; u <= t; ++u) {
-                        ds[u] = p[u] * (dpi[u] - dot);
-                    }
+        ds_.resize(bh_count, T, T);
+#pragma omp parallel for schedule(static) if(attn_work >= kMinParallelWork)
+        for (int bh = 0; bh < bh_count; ++bh) {
+            for (int t = 0; t < T; ++t) {
+                const real* p = att_.row(bh, t);
+                const real* dpi = dp.row(bh, t);
+                real* ds = ds_.row(bh, t);
+                real dot = 0;
+                for (int u = 0; u <= t; ++u) {
+                    dot += p[u] * dpi[u];
+                }
+                for (int u = 0; u <= t; ++u) {
+                    ds[u] = p[u] * (dpi[u] - dot);
                 }
             }
         }
 
-        for (int b = 0; b < B; ++b) {
-            for (int h = 0; h < n_head_; ++h) {
-                const int bh = b * n_head_ + h;
-                for (int t = 0; t < T; ++t) {
-                    const real* RESTRICT ds = ds_.row(bh, t);
-                    const real* RESTRICT qi = q.row(b, t) + h * hs_;
-                    real* RESTRICT dqi = dq_.row(b, t) + h * hs_;
-                    for (int u = 0; u <= t; ++u) {
-                        const real* RESTRICT ki = k.row(b, u) + h * hs_;
-                        real* RESTRICT dki = dk_.row(b, u) + h * hs_;
-                        const real s = ds[u] * scale;
-                        for (int dd = 0; dd < hs_; ++dd) {
-                            dqi[dd] += s * ki[dd];
-                            dki[dd] += s * qi[dd];
-                        }
+        // dk accumulates down the key axis the way dv did, so this splits by
+        // (batch, head) for the same reason.
+#pragma omp parallel for schedule(static) if(attn_work >= kMinParallelWork)
+        for (int bh = 0; bh < bh_count; ++bh) {
+            const int b = bh / n_head_;
+            const int h = bh % n_head_;
+            for (int t = 0; t < T; ++t) {
+                const real* RESTRICT ds = ds_.row(bh, t);
+                const real* RESTRICT qi = q.row(b, t) + h * hs_;
+                real* RESTRICT dqi = dq_.row(b, t) + h * hs_;
+                for (int u = 0; u <= t; ++u) {
+                    const real* RESTRICT ki = k.row(b, u) + h * hs_;
+                    real* RESTRICT dki = dk_.row(b, u) + h * hs_;
+                    const real s = ds[u] * scale;
+                    for (int dd = 0; dd < hs_; ++dd) {
+                        dqi[dd] += s * ki[dd];
+                        dki[dd] += s * qi[dd];
                     }
                 }
             }
@@ -806,7 +975,9 @@ public:
         const Matrix& dxv = value_.backward(dv_);
 
         dx_.resize(B, T, n_embd_);
-        for (size_t i = 0; i < dx_.v.size(); ++i) {
+        const int n = static_cast<int>(dx_.v.size());
+#pragma omp parallel for schedule(static) if(n >= kMinParallelElems)
+        for (int i = 0; i < n; ++i) {
             dx_.v[i] = dxq.v[i] + dxk.v[i] + dxv.v[i];
         }
         return dx_;
@@ -914,15 +1085,19 @@ public:
     const Matrix& out() const override { return out_; }
 
     const Matrix& forward(const Matrix& x) override {
+        const int n = x.batch * x.time * x.cols;
+
         const Matrix& b = attn_.forward(ln1_.forward(x));
         mid_.resize(x.batch, x.time, x.cols);
-        for (size_t i = 0; i < mid_.v.size(); ++i) {
+#pragma omp parallel for schedule(static) if(n >= kMinParallelElems)
+        for (int i = 0; i < n; ++i) {
             mid_.v[i] = x.v[i] + b.v[i];
         }
 
         const Matrix& d = ffwd_.forward(ln2_.forward(mid_));
         out_.resize(x.batch, x.time, x.cols);
-        for (size_t i = 0; i < out_.v.size(); ++i) {
+#pragma omp parallel for schedule(static) if(n >= kMinParallelElems)
+        for (int i = 0; i < n; ++i) {
             out_.v[i] = mid_.v[i] + d.v[i];
         }
         return out_;
@@ -932,15 +1107,19 @@ public:
     // backward pass: the gradient arriving at `out` reaches `mid` both through
     // the feedforward branch and directly along the skip.
     const Matrix& backward(const Matrix& dout) override {
+        const int n = dout.batch * dout.time * dout.cols;
+
         const Matrix& dmid_branch = ln2_.backward(ffwd_.backward(dout));
         dmid_.resize(dout.batch, dout.time, dout.cols);
-        for (size_t i = 0; i < dmid_.v.size(); ++i) {
+#pragma omp parallel for schedule(static) if(n >= kMinParallelElems)
+        for (int i = 0; i < n; ++i) {
             dmid_.v[i] = dout.v[i] + dmid_branch.v[i];
         }
 
         const Matrix& dx_branch = ln1_.backward(attn_.backward(dmid_));
         dx_.resize(dout.batch, dout.time, dout.cols);
-        for (size_t i = 0; i < dx_.v.size(); ++i) {
+#pragma omp parallel for schedule(static) if(n >= kMinParallelElems)
+        for (int i = 0; i < n; ++i) {
             dx_.v[i] = dmid_.v[i] + dx_branch.v[i];
         }
         return dx_;
@@ -994,18 +1173,35 @@ inline real cross_entropy(const Matrix& logits, const int* targets, Matrix* dlog
     }
 
     const real inv_n = real(1) / n;
-    real total = 0;
-    std::vector<real> probs(static_cast<size_t>(vocab));
-    for (int i = 0; i < n; ++i) {
-        softmax_row(logits.row(i), probs.data(), vocab);
-        const int y = targets[i];
-        total += -std::log(probs[static_cast<size_t>(y)]);
-        if (dlogits) {
-            real* dl = dlogits->row(i);
-            for (int j = 0; j < vocab; ++j) {
-                dl[j] = (probs[static_cast<size_t>(j)] - (j == y ? real(1) : real(0))) * inv_n;
+
+    // Every row scores on its own, but two things here are shared: the softmax
+    // needs a scratch row of probabilities, and the loss is a sum over all the
+    // rows. The scratch buffer is declared inside the parallel region so each
+    // thread allocates its own, and the per-row losses go to an array that is
+    // added up afterwards in order - so the number this returns is the same
+    // number whatever size the team was.
+    std::vector<real> row_loss(static_cast<size_t>(n));
+#pragma omp parallel if(n >= kMinParallelRows)
+    {
+        std::vector<real> probs(static_cast<size_t>(vocab));
+#pragma omp for schedule(static)
+        for (int i = 0; i < n; ++i) {
+            softmax_row(logits.row(i), probs.data(), vocab);
+            const int y = targets[i];
+            row_loss[static_cast<size_t>(i)] =
+                -std::log(probs[static_cast<size_t>(y)]);
+            if (dlogits) {
+                real* dl = dlogits->row(i);
+                for (int j = 0; j < vocab; ++j) {
+                    dl[j] = (probs[static_cast<size_t>(j)] - (j == y ? real(1) : real(0))) * inv_n;
+                }
             }
         }
+    }
+
+    real total = 0;
+    for (int i = 0; i < n; ++i) {
+        total += row_loss[static_cast<size_t>(i)];
     }
     return total * inv_n;
 }
@@ -1110,8 +1306,14 @@ public:
     }
 
     void zero_grad() {
-        for (Param& p : params_) {
-            std::fill(p.grad->begin(), p.grad->end(), real(0));
+        // One tensor per iteration, dynamically scheduled: these differ in size
+        // by three orders of magnitude, and a static split would hand one
+        // thread the token embedding table and another two bias vectors.
+        const int n = static_cast<int>(params_.size());
+#pragma omp parallel for schedule(dynamic, 1)
+        for (int i = 0; i < n; ++i) {
+            std::vector<real>& g = *params_[static_cast<size_t>(i)].grad;
+            std::fill(g.begin(), g.end(), real(0));
         }
     }
 
@@ -1119,15 +1321,17 @@ public:
         CHECK(T > 0 && T <= cfg_.block, "a window of " << T
             << " positions, but the position table has " << cfg_.block << " rows");
 
+        // Flattened over (batch, position), which is the same walk the nested
+        // loops made: row i of the tensor is window i/T at slot i%T.
+        const int rows = B * T;
         emb_.resize(B, T, cfg_.n_embd);
-        for (int b = 0; b < B; ++b) {
-            for (int t = 0; t < T; ++t) {
-                const real* tok = &wte_[static_cast<size_t>(x[b * T + t]) * cfg_.n_embd];
-                const real* pos = &wpe_[static_cast<size_t>(t) * cfg_.n_embd];
-                real* e = emb_.row(b, t);
-                for (int c = 0; c < cfg_.n_embd; ++c) {
-                    e[c] = tok[c] + pos[c];
-                }
+#pragma omp parallel for schedule(static) if(rows >= kMinParallelRows)
+        for (int i = 0; i < rows; ++i) {
+            const real* tok = &wte_[static_cast<size_t>(x[i]) * cfg_.n_embd];
+            const real* pos = &wpe_[static_cast<size_t>(i % T) * cfg_.n_embd];
+            real* e = emb_.row(i);
+            for (int c = 0; c < cfg_.n_embd; ++c) {
+                e[c] = tok[c] + pos[c];
             }
         }
 
@@ -1154,6 +1358,13 @@ public:
         // += is load-bearing: a character that appears eight times in a batch
         // contributes eight times, and every one of the B windows uses the same
         // row of the position table for slot t.
+        //
+        // Which is also why this is the one loop in the model that stays
+        // serial. Those repeats are collisions: two positions holding the same
+        // character, or the same slot in different windows, want the same row
+        // at the same time, and there is no axis to split that does not have
+        // them. It is one pass over (B, T, C) against the matrix multiplies on
+        // either side of it, so it is not where the time is anyway.
         for (int b = 0; b < B; ++b) {
             for (int t = 0; t < T; ++t) {
                 const real* de = d->row(b, t);
@@ -1283,11 +1494,18 @@ public:
         const real bc1 = real(1) - std::pow(beta1_, static_cast<real>(t_));
         const real bc2 = real(1) - std::pow(beta2_, static_cast<real>(t_));
 
-        for (size_t k = 0; k < params_->size(); ++k) {
-            std::vector<real>& p = *(*params_)[k].data;
-            const std::vector<real>& g = *(*params_)[k].grad;
-            std::vector<real>& m = m_[k];
-            std::vector<real>& v = v_[k];
+        // Every parameter steps independently of every other, so the only
+        // question is which axis to hand out. Splitting the tensors rather than
+        // the elements within them costs one fork per step instead of one per
+        // tensor, and dynamic scheduling covers their very different sizes.
+        const int np = static_cast<int>(params_->size());
+#pragma omp parallel for schedule(dynamic, 1)
+        for (int k = 0; k < np; ++k) {
+            const size_t kk = static_cast<size_t>(k);
+            std::vector<real>& p = *(*params_)[kk].data;
+            const std::vector<real>& g = *(*params_)[kk].grad;
+            std::vector<real>& m = m_[kk];
+            std::vector<real>& v = v_[kk];
             for (size_t i = 0; i < p.size(); ++i) {
                 m[i] = beta1_ * m[i] + (real(1) - beta1_) * g[i];
                 v[i] = beta2_ * v[i] + (real(1) - beta2_) * g[i] * g[i];

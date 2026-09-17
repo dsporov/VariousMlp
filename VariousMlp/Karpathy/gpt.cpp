@@ -529,6 +529,8 @@ void test_gpt() {
     std::cout << "\n== 6. the full model ==\n";
     printf("  %d channels, %d heads, %d blocks, context %d, batch %d, lr %.0e\n",
         kEmbed, kHeads, kLayers, kBlock, kBatch, kLr);
+    printf("  %d thread%s\n", available_threads(),
+        available_threads() == 1 ? "" : "s");
     std::mt19937 g6(1337);
     const Config cfg{ kEmbed, kHeads, kLayers, kBlock, kBatch, kDropout, kLr };
     Gpt model(cfg, d.vocab, g6);
@@ -617,19 +619,21 @@ void test_gpt() {
 
     printf("  %zu parameters (the video reads 10.788929 M)\n", big_params);
     printf("  this machine runs the small model at %.2f GFLOP/s "
-        "(timed over %d steps)\n", measured / 1e9, kBenchSteps);
+        "(timed over %d steps on %d thread%s)\n", measured / 1e9, kBenchSteps,
+        available_threads(), available_threads() == 1 ? "" : "s");
     printf("  one step of the scaled-up model is %.2f TFLOP, so %d steps is "
         "%.1f days\n", step_flops(big, big_params, d.vocab) / 1e12, kIters,
         projected / measured / 86400.0);
     printf("  its activation buffers would need about %.1f GB at %zu bytes per "
         "scalar\n", bytes / 1e9, sizeof(real));
     std::cout <<
-        "  Which is the honest state of this port: the model is right and the\n"
-        "  arithmetic is not fast enough to use it. Every inner loop here is\n"
-        "  scalar, single-threaded and unblocked, and the three fixes for that -\n"
-        "  vectorising, threading, and blocking for cache - are worth about two\n"
-        "  orders of magnitude between them. That is the difference between a\n"
-        "  month and an overnight run, and it is a separate piece of work.\n";
+        "  Which is the honest state of this port. Of the three things that\n"
+        "  would fix it - vectorising, threading, and blocking for cache - the\n"
+        "  second is done, and the rate above is what it left. The other two\n"
+        "  are still open: every inner loop is scalar double, and every one of\n"
+        "  them streams a whole weight matrix past the cache for each row it\n"
+        "  handles. Between them they are still worth more than the threading\n"
+        "  was, and they are the difference between a week and a night.\n";
 
     // A plain if, not `if constexpr`: the project sets no <LanguageStandard>,
     // so MSVC builds it as C++14. The branch folds away either way, and the
