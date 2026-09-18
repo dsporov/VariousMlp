@@ -367,9 +367,13 @@ double run_flops(const Config& cfg, size_t params, int vocab, int iters,
     return per_step * iters + per_step * evals / 3.0;
 }
 
-// Steps timed for the throughput figure in section 8. Enough to get past the
-// first-touch page faults and the turbo ramp, few enough to be unnoticeable.
-constexpr int kBenchSteps = 200;
+// Steps timed for the throughput figure in section 8, after the one untimed
+// warm-up step below. 200 was enough while every loop ran serially, because the
+// window was then just under three seconds; threading cut it to well under one,
+// short enough that scheduling and turbo jitter stopped averaging out. This is
+// a few seconds threaded and is the one part of section 8 that a serial build
+// notices.
+constexpr int kBenchSteps = 1000;
 
 // Timed on a throwaway model rather than on the trained one, so the number
 // means the same thing whether section 6 trained or loaded a checkpoint - and
@@ -380,12 +384,23 @@ double measure_throughput(const Config& cfg, const Data& d, int vocab, int steps
     AdamW opt(probe.params(), cfg.lr);
     std::vector<int> x, y;
 
-    const auto t0 = std::chrono::steady_clock::now();
-    for (int i = 0; i < steps; ++i) {
+    const auto one_step = [&]() {
         sample_batch(d.train, cfg.batch, cfg.block, x, y, g);
         probe.zero_grad();
         probe.forward_backward(x.data(), y.data(), cfg.batch, cfg.block);
         opt.step();
+    };
+
+    // The first step pays for everything that only ever happens once: the
+    // activation buffers are allocated by that first forward pass and faulted
+    // in a page at a time, and the OpenMP pool is built at its first parallel
+    // region. Leaving those inside the clock is what made the printed rate
+    // disagree with the wall clock section 6 had just demonstrated.
+    one_step();
+
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < steps; ++i) {
+        one_step();
     }
     const double secs = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - t0).count();
@@ -633,7 +648,8 @@ void test_gpt() {
         "  are still open: every inner loop is scalar double, and every one of\n"
         "  them streams a whole weight matrix past the cache for each row it\n"
         "  handles. Between them they are still worth more than the threading\n"
-        "  was, and they are the difference between a week and a night.\n";
+        "  was, and they are the difference between the days above and a\n"
+        "  night.\n";
 
     // A plain if, not `if constexpr`: the project sets no <LanguageStandard>,
     // so MSVC builds it as C++14. The branch folds away either way, and the

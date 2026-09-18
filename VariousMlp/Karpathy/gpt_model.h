@@ -63,11 +63,18 @@
 // reason.
 namespace gpt {
 
-// The scalar type, named once. Pascal consumer GPUs and every SIMD unit run
-// float at twice the rate of double, so the performance pass flips this - but
-// not before it has to: gradient_check() leans on central differences being
-// good to about 1e-9, which is a property of double and not of float.
-using real = double;
+// The scalar type, named once. Flipped to float on 2026-09-18, the threading
+// pass having run out of room: an AVX2 register holds 8 lanes of it instead of
+// 4, and half as many bytes cross the cache per weight, so it is the one change
+// that helps both of the two things still left undone here.
+//
+// What it costs is gradient_check(), which leans on central differences being
+// good to about 1e-9 - a property of double and not of float. Its kH and
+// kTolerance widen accordingly, and it stops being evidence that the gradients
+// are exact and becomes evidence that they are not wrong. Flipping back is this
+// one line: checkpoints carry sizeof(real) in their filename, so a double build
+// and a float build keep separate files and neither will read the other's.
+using real = float;
 
 // Inside a parallel region these describe the team. Outside one - and in a
 // build with no OpenMP at all - they describe the single thread that is
