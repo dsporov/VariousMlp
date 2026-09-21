@@ -645,11 +645,11 @@ void test_gpt() {
         "  Which is the honest state of this port. Of the three things that\n"
         "  would fix it - vectorising, threading, and blocking for cache - the\n"
         "  second is done, and the rate above is what it left. The other two\n"
-        "  are still open: every inner loop is scalar double, and every one of\n"
-        "  them streams a whole weight matrix past the cache for each row it\n"
-        "  handles. Between them they are still worth more than the threading\n"
-        "  was, and they are the difference between the days above and a\n"
-        "  night.\n";
+        "  are still open: neither /arch:AVX2 nor dropping from double to float\n"
+        "  has moved that rate, and every inner loop streams a whole weight\n"
+        "  matrix past the cache for each row it handles. Between them they are\n"
+        "  still worth more than the threading was, and they are the difference\n"
+        "  between the days above and a night.\n";
 
     // A plain if, not `if constexpr`: the project sets no <LanguageStandard>,
     // so MSVC builds it as C++14. The branch folds away either way, and the

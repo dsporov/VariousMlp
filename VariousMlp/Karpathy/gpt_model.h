@@ -66,7 +66,10 @@ namespace gpt {
 // The scalar type, named once. Flipped to float on 2026-09-18, the threading
 // pass having run out of room: an AVX2 register holds 8 lanes of it instead of
 // 4, and half as many bytes cross the cache per weight, so it is the one change
-// that helps both of the two things still left undone here.
+// that should help both of the two things still left undone here. Measured on
+// the i9 it helped neither: section 6 took 18.3s against double's 17.9s. That
+// says the loops are not being vectorised, or are too short at 32 channels for
+// it to matter - not that float was a mistake.
 //
 // What it costs is gradient_check(), which leans on central differences being
 // good to about 1e-9 - a property of double and not of float. Its kH and
