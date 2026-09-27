@@ -2,7 +2,7 @@
 // ("The spelled-out intro to neural networks and backpropagation", video 1 of
 //  Neural Networks: Zero to Hero)
 //
-// Build:  g++ -std=c++17 -O2 micrograd.cpp -o micrograd
+// Build:  g++ -std=c++20 -O2 micrograd.cpp -o micrograd
 // Run:    ./micrograd
 
 #include <algorithm>

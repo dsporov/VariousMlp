@@ -637,11 +637,10 @@ void test_gpt() {
         "  runs this same model through a cache-blocked, vectorised multiply\n"
         "  and measures what the pair is worth at the scaled-up width.\n";
 
-    // A plain if, not `if constexpr`: the project sets no <LanguageStandard>,
-    // so MSVC builds it as C++14. The branch folds away either way, and the
-    // body still gets compiled and type-checked, which is the point of having
-    // it here rather than in a comment.
-    if (kRunScaleUp) {
+    // Outside a template, `if constexpr` still compiles and type-checks the
+    // branch it discards, which is the point of having it here rather than
+    // in a comment.
+    if constexpr (kRunScaleUp) {
         std::mt19937 gb(1337);
         Gpt big_model(big, d.vocab, gb);
 

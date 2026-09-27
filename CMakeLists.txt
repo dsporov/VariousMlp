@@ -13,9 +13,11 @@
 cmake_minimum_required(VERSION 3.24)
 project(VariousMlp LANGUAGES CXX)
 
-# The sources were written against C++14 - the vcxproj never set a standard -
-# and nothing in them means anything different under 17. libtorch needs 17.
-set(CMAKE_CXX_STANDARD 17)
+# C++20, because recent libtorch headers need it and one standard for every
+# target is simpler than two. The older sources were written against C++14
+# and 17, and none of what 20 changed (aggregates, rewritten comparisons, u8
+# literals) touches them. The vcxproj asks for the same standard.
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
@@ -163,7 +165,7 @@ if(VARIOUSMLP_CUDA)
             set(CMAKE_CUDA_ARCHITECTURES native)
         endif()
         enable_language(CUDA)
-        set(CMAKE_CUDA_STANDARD 17)
+        set(CMAKE_CUDA_STANDARD 20)
         set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
         add_executable(gpt_cuda

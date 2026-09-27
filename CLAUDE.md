@@ -1,6 +1,6 @@
 # VariousMlp
 
-C++17 ports of Andrej Karpathy's "Neural Networks: Zero to Hero" videos, plus
+C++20 ports of Andrej Karpathy's "Neural Networks: Zero to Hero" videos, plus
 alternative implementations of the GPT from the last video (blocked CPU
 multiply, ATen, CUDA), made to try out new tools. Performance is a side
 interest here, not the goal. Built with CMake: Visual Studio 2022 (MSVC, x64)
@@ -43,6 +43,9 @@ there for the walkthrough executable.
 
 - `gpt_aten` is built without OpenMP on purpose: libtorch brings its own
   runtime, and two runtimes in one process conflict.
+- Everything is C++20, because recent libtorch headers need it: CMake sets it
+  for C++ and CUDA, and the vcxproj sets `<LanguageStandard>stdcpp20`. Keep
+  the two in step.
 - `gpt_cuda.h` is plain C++ so that nvcc never compiles `gpt_model.h`. Keep it
   that way: CUDA types stay in `gpt_cuda.cu`.
 - The CMake build defines `VARIOUSMLP_DATA_DIR` (absolute path of
