@@ -342,23 +342,9 @@ void gradient_check(const Data& d, std::mt19937& g) {
     chk.report();
 }
 
-// Roughly what one training step costs. The forward pass is two multiply-adds
-// per parameter per token and the backward pass is twice that again, which is
-// the standard 6N estimate; the two embedding tables come out because they are
-// lookups rather than matrix multiplies. Attention's own two matmuls are not
-// parameters at all, and at context 256 they stop being a rounding error.
-double step_flops(const Config& cfg, size_t params, int vocab) {
-    const double lookups = static_cast<double>(vocab + cfg.block) * cfg.n_embd;
-    const double matmul = static_cast<double>(params) - lookups;
-    const double tokens = static_cast<double>(cfg.batch) * cfg.block;
-    const double attention = 6.0 * cfg.block * (cfg.block + 1.0)
-        * cfg.n_embd * cfg.batch * cfg.n_layer;
-    return 6.0 * matmul * tokens + attention;
-}
-
-// The same for a whole training run, including the evaluation passes, which
-// are a sixth of the total and would otherwise make the throughput below look
-// better than it is.
+// step_flops() in gpt_model.h, for a whole training run: the cost of one step,
+// times the steps, plus the evaluation passes, which are a sixth of the total
+// and would otherwise make the throughput below look better than it is.
 double run_flops(const Config& cfg, size_t params, int vocab, int iters,
     int report_every) {
     const double per_step = step_flops(cfg, params, vocab);
@@ -645,11 +631,11 @@ void test_gpt() {
         "  Which is the honest state of this port. Of the three things that\n"
         "  would fix it - vectorising, threading, and blocking for cache - the\n"
         "  second is done, and the rate above is what it left. The other two\n"
-        "  are still open: neither /arch:AVX2 nor dropping from double to float\n"
-        "  has moved that rate, and every inner loop streams a whole weight\n"
-        "  matrix past the cache for each row it handles. Between them they are\n"
-        "  still worth more than the threading was, and they are the difference\n"
-        "  between the days above and a night.\n";
+        "  are still open here: neither /arch:AVX2 nor dropping from double to\n"
+        "  float has moved that rate, and every inner loop streams a whole\n"
+        "  weight matrix past the cache for each row it handles. gpt_blocked\n"
+        "  runs this same model through a cache-blocked, vectorised multiply\n"
+        "  and measures what the pair is worth at the scaled-up width.\n";
 
     // A plain if, not `if constexpr`: the project sets no <LanguageStandard>,
     // so MSVC builds it as C++14. The branch folds away either way, and the

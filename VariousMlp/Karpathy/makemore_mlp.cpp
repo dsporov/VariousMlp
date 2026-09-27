@@ -71,8 +71,13 @@ inline char decode(int i) {
 std::vector<std::string> load_names() {
     // Relative to a few plausible working directories: Visual Studio runs with
     // cwd = $(ProjectDir), a bare exe run has cwd = x64\Debug, and running from
-    // the repo root is the other common case.
+    // the repo root is the other common case. A CMake build runs from somewhere
+    // in its build tree, which none of those reach, so it names the directory
+    // outright and that goes first.
     static const char* kCandidates[] = {
+#ifdef VARIOUSMLP_DATA_DIR
+        VARIOUSMLP_DATA_DIR "/names.txt",
+#endif
         "Karpathy/names.txt",
         "names.txt",
         "VariousMlp/Karpathy/names.txt",

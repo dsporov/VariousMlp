@@ -1,16 +1,18 @@
-// gpt_model.h - the Transformer itself, shared by the two files that use it.
+// gpt_model.h - the Transformer itself, shared by every file that uses it.
 //
 // gpt.cpp is the walkthrough: it builds the model up the way the video does,
 // trains it, and checks the numbers. gpt_chat.cpp is a tool: it loads a
-// checkpoint the walkthrough saved and lets you type at it. They need the same
-// model, and a tool is not a video port, so the convention that each of these
-// files is read start to finish on its own applies to gpt.cpp and not here.
+// checkpoint the walkthrough saved and lets you type at it. gpt_bench.h holds
+// this model up as the reference that the other implementations - blocked,
+// ATen, CUDA - are checked against. They all need the same model, and none of
+// them is a video port, so the convention that each of these files is read
+// start to finish on its own applies to gpt.cpp and not here.
 //
 // Everything a reader would want to read is still in order below - the data,
 // the layers, attention, the blocks, the optimiser, the checkpoint format -
 // and the commentary came with it. What stayed in gpt.cpp is only what the
-// walkthrough itself needs: the bigram baseline, the two demonstrations, the
-// cost model, and the numbers the video reads out.
+// walkthrough itself needs: the bigram baseline, the two demonstrations, most
+// of the cost model, and the numbers the video reads out.
 
 #pragma once
 
@@ -31,6 +33,7 @@
 #include <vector>
 
 #include "check.h"
+#include "gpt_gemm.h"
 
 // Neither MSVC nor gcc will vectorise a loop that stores through one pointer
 // and loads through another unless it can prove the two do not overlap, and
@@ -106,6 +109,27 @@ inline int available_threads() {
 #else
     return 1;
 #endif
+}
+
+// Which code the multiplies below run. kScalar is the loops as written, which
+// produced every number the walkthrough prints. kBlocked hands the Linear
+// layers and the four products inside attention to the cache-blocked,
+// vectorised multiply in gpt_gemm.h. The two agree to float rounding rather
+// than bit for bit, so the walkthrough stays on kScalar - its reproduction
+// checks are to four decimals - and gpt_blocked.cpp is where kBlocked runs.
+//
+// A process-wide switch rather than a constructor argument, because it is a
+// property of the arithmetic and not of the model: gpt_bench.h flips it around
+// individual calls to run one set of weights both ways.
+enum class Kernels { kScalar, kBlocked };
+
+inline Kernels& active_kernels() {
+    static Kernels k = Kernels::kScalar;
+    return k;
+}
+
+inline bool blocked_kernels() {
+    return active_kernels() == Kernels::kBlocked;
 }
 
 // Handing a loop to a team of threads costs a few microseconds, so a loop needs
@@ -202,8 +226,13 @@ inline std::string printable(char c) {
 inline bool load_corpus(Data& d) {
     // Relative to a few plausible working directories: Visual Studio runs with
     // cwd = $(ProjectDir), a bare exe run has cwd = x64\Debug, and running from
-    // the repo root is the other common case.
+    // the repo root is the other common case. A CMake build runs from somewhere
+    // in its build tree, which none of those reach, so it names this directory
+    // outright and that goes first.
     static const char* kDirs[] = {
+#ifdef VARIOUSMLP_DATA_DIR
+        VARIOUSMLP_DATA_DIR "/",
+#endif
         "Karpathy/",
         "",
         "VariousMlp/Karpathy/",
@@ -420,6 +449,19 @@ public:
         x_ = &x;
         out_.resize(x.batch, x.time, fan_out_);
         const int n = x.rows();
+        if (blocked_kernels()) {
+            // Seeding every row with the bias turns x*W + b into the
+            // add-into-C multiply that gpt_gemm.h provides.
+            if (has_bias_) {
+                for (int i = 0; i < n; ++i) {
+                    std::copy(b_.begin(), b_.end(), out_.row(i));
+                }
+            }
+            blocked::gemm(false, false, n, fan_out_, fan_in_, real(1),
+                x.v.data(), fan_in_, w_.data(), fan_out_,
+                out_.v.data(), fan_out_, true);
+            return out_;
+        }
         // One row per iteration, and no other iteration touches that row.
 #pragma omp parallel for schedule(static) if(n >= kMinParallelRows)
         for (int i = 0; i < n; ++i) {
@@ -463,6 +505,21 @@ public:
         dx_.resize(x.batch, x.time, fan_in_);
         const int n = x.rows();
 
+        if (blocked_kernels()) {
+            // dx = dout * W^T and dW += x^T * dout: the same multiply with a
+            // different operand transposed. How to split them across threads
+            // is the multiply's business now, and it keeps every output on one
+            // thread, so neither sum depends on the size of the team.
+            blocked::gemm(false, true, n, fan_in_, fan_out_, real(1),
+                dout.v.data(), fan_out_, w_.data(), fan_out_,
+                dx_.v.data(), fan_in_, true);
+            blocked::gemm(true, false, fan_in_, fan_out_, n, real(1),
+                x.v.data(), fan_in_, dout.v.data(), fan_out_,
+                dw_.data(), fan_out_, true);
+            accumulate_bias_grad(dout);
+            return dx_;
+        }
+
 #pragma omp parallel for schedule(static) if(n >= kMinParallelRows)
         for (int i = 0; i < n; ++i) {
             // Distinct vectors: dout's storage and dx_'s.
@@ -491,18 +548,7 @@ public:
             }
         }
 
-        // db is a column sum, and it stays serial. It is one pass over dout
-        // against the fan_in passes above - a fraction of a percent of the work
-        // here - and splitting fan_out doubles across sixteen threads would put
-        // several of them on one cache line, which costs more than it saves.
-        if (has_bias_) {
-            for (int i = 0; i < n; ++i) {
-                const real* di = dout.row(i);
-                for (int j = 0; j < fan_out_; ++j) {
-                    db_[j] += di[j];
-                }
-            }
-        }
+        accumulate_bias_grad(dout);
         return dx_;
     }
 
@@ -514,6 +560,24 @@ public:
     }
 
 private:
+    // db is a column sum, and it stays serial. It is one pass over dout
+    // against the fan_in passes of the multiply - a fraction of a percent of
+    // the work here - and splitting fan_out doubles across sixteen threads
+    // would put several of them on one cache line, which costs more than it
+    // saves. Both kinds of kernel share it.
+    void accumulate_bias_grad(const Matrix& dout) {
+        if (!has_bias_) {
+            return;
+        }
+        const int n = dout.rows();
+        for (int i = 0; i < n; ++i) {
+            const real* di = dout.row(i);
+            for (int j = 0; j < fan_out_; ++j) {
+                db_[j] += di[j];
+            }
+        }
+    }
+
     int fan_in_;
     int fan_out_;
     bool has_bias_;
@@ -838,24 +902,51 @@ public:
         const long long attn_work = static_cast<long long>(bh_count) * T * T;
 
         att_.resize(bh_count, T, T);
+        if (blocked_kernels()) {
+            // The scores for one (batch, head) are Q K^T scaled, a T x T
+            // product whose operands are that head's hs-wide slice of every
+            // row - hence the n_embd strides. The whole square is multiplied
+            // and the masked half then overwritten, which wastes half of a
+            // product that is a few percent of the model's arithmetic in
+            // exchange for handing the multiply a plain rectangle. Each call
+            // stays on its thread; the threads are already split by head.
 #pragma omp parallel for schedule(static) if(attn_work >= kMinParallelWork)
-        for (int bh = 0; bh < bh_count; ++bh) {
-            const int b = bh / n_head_;
-            const int h = bh % n_head_;
-            for (int t = 0; t < T; ++t) {
-                real* a = att_.row(bh, t);
-                const real* qi = q.row(b, t) + h * hs_;
-                for (int u = 0; u <= t; ++u) {
-                    const real* ki = k.row(b, u) + h * hs_;
-                    real s = 0;
-                    for (int dd = 0; dd < hs_; ++dd) {
-                        s += qi[dd] * ki[dd];
+            for (int bh = 0; bh < bh_count; ++bh) {
+                const int b = bh / n_head_;
+                const int h = bh % n_head_;
+                real* s = att_.row(bh, 0);
+                blocked::gemm(false, true, T, T, hs_, scale,
+                    q.row(b, 0) + h * hs_, n_embd_, k.row(b, 0) + h * hs_, n_embd_,
+                    s, T, false);
+                for (int t = 0; t < T; ++t) {
+                    real* a = s + static_cast<size_t>(t) * T;
+                    softmax_row(a, a, t + 1);
+                    for (int u = t + 1; u < T; ++u) {
+                        a[u] = real(0);
                     }
-                    a[u] = s * scale;
                 }
-                softmax_row(a, a, t + 1);
-                for (int u = t + 1; u < T; ++u) {
-                    a[u] = real(0);        // the masked future
+            }
+        }
+        else {
+#pragma omp parallel for schedule(static) if(attn_work >= kMinParallelWork)
+            for (int bh = 0; bh < bh_count; ++bh) {
+                const int b = bh / n_head_;
+                const int h = bh % n_head_;
+                for (int t = 0; t < T; ++t) {
+                    real* a = att_.row(bh, t);
+                    const real* qi = q.row(b, t) + h * hs_;
+                    for (int u = 0; u <= t; ++u) {
+                        const real* ki = k.row(b, u) + h * hs_;
+                        real s = 0;
+                        for (int dd = 0; dd < hs_; ++dd) {
+                            s += qi[dd] * ki[dd];
+                        }
+                        a[u] = s * scale;
+                    }
+                    softmax_row(a, a, t + 1);
+                    for (int u = t + 1; u < T; ++u) {
+                        a[u] = real(0);        // the masked future
+                    }
                 }
             }
         }
@@ -865,18 +956,32 @@ public:
         // Head h writes channels [h*hs, (h+1)*hs) of heads_ and no others, so
         // the threads never meet even though they share the tensor.
         heads_.resize(B, T, n_embd_);
+        if (blocked_kernels()) {
+            // The weights are zero above the diagonal, so multiplying the full
+            // square by V adds nothing from the future.
 #pragma omp parallel for schedule(static) if(attn_work >= kMinParallelWork)
-        for (int bh = 0; bh < bh_count; ++bh) {
-            const int b = bh / n_head_;
-            const int h = bh % n_head_;
-            for (int t = 0; t < T; ++t) {
-                const real* p = a.row(bh, t);
-                real* o = heads_.row(b, t) + h * hs_;
-                for (int u = 0; u <= t; ++u) {
-                    const real* vi = v.row(b, u) + h * hs_;
-                    const real w = p[u];
-                    for (int dd = 0; dd < hs_; ++dd) {
-                        o[dd] += w * vi[dd];
+            for (int bh = 0; bh < bh_count; ++bh) {
+                const int b = bh / n_head_;
+                const int h = bh % n_head_;
+                blocked::gemm(false, false, T, hs_, T, real(1),
+                    a.row(bh, 0), T, v.row(b, 0) + h * hs_, n_embd_,
+                    heads_.row(b, 0) + h * hs_, n_embd_, false);
+            }
+        }
+        else {
+#pragma omp parallel for schedule(static) if(attn_work >= kMinParallelWork)
+            for (int bh = 0; bh < bh_count; ++bh) {
+                const int b = bh / n_head_;
+                const int h = bh % n_head_;
+                for (int t = 0; t < T; ++t) {
+                    const real* p = a.row(bh, t);
+                    real* o = heads_.row(b, t) + h * hs_;
+                    for (int u = 0; u <= t; ++u) {
+                        const real* vi = v.row(b, u) + h * hs_;
+                        const real w = p[u];
+                        for (int dd = 0; dd < hs_; ++dd) {
+                            o[dd] += w * vi[dd];
+                        }
                     }
                 }
             }
@@ -913,24 +1018,44 @@ public:
         // (batch, head) leaves it alone - thread bh owns batch b's channels
         // [h*hs, (h+1)*hs) of dv outright, and still walks t in order, so the
         // sums come out in the order the serial version produced them.
+        if (blocked_kernels()) {
+            // dA = dO V^T and dV = A^T dO, per (batch, head). dA comes out
+            // above the diagonal as well, as dot products nobody asked for;
+            // the softmax backward below only reads u <= t, so they go
+            // nowhere. A^T dO needs no such care, because A is zero there.
 #pragma omp parallel for schedule(static) if(attn_work >= kMinParallelWork)
-        for (int bh = 0; bh < bh_count; ++bh) {
-            const int b = bh / n_head_;
-            const int h = bh % n_head_;
-            for (int t = 0; t < T; ++t) {
-                const real* RESTRICT dO = dheads.row(b, t) + h * hs_;
-                const real* RESTRICT p = a.row(bh, t);
-                real* RESTRICT dA = da_.row(bh, t);
-                for (int u = 0; u <= t; ++u) {
-                    const real* RESTRICT vi = v.row(b, u) + h * hs_;
-                    real* RESTRICT dvi = dv_.row(b, u) + h * hs_;
-                    real dot = 0;
-                    const real w = p[u];
-                    for (int dd = 0; dd < hs_; ++dd) {
-                        dot += dO[dd] * vi[dd];
-                        dvi[dd] += w * dO[dd];
+            for (int bh = 0; bh < bh_count; ++bh) {
+                const int b = bh / n_head_;
+                const int h = bh % n_head_;
+                const real* dO = dheads.row(b, 0) + h * hs_;
+                blocked::gemm(false, true, T, T, hs_, real(1),
+                    dO, n_embd_, v.row(b, 0) + h * hs_, n_embd_,
+                    da_.row(bh, 0), T, false);
+                blocked::gemm(true, false, T, hs_, T, real(1),
+                    a.row(bh, 0), T, dO, n_embd_,
+                    dv_.row(b, 0) + h * hs_, n_embd_, false);
+            }
+        }
+        else {
+#pragma omp parallel for schedule(static) if(attn_work >= kMinParallelWork)
+            for (int bh = 0; bh < bh_count; ++bh) {
+                const int b = bh / n_head_;
+                const int h = bh % n_head_;
+                for (int t = 0; t < T; ++t) {
+                    const real* RESTRICT dO = dheads.row(b, t) + h * hs_;
+                    const real* RESTRICT p = a.row(bh, t);
+                    real* RESTRICT dA = da_.row(bh, t);
+                    for (int u = 0; u <= t; ++u) {
+                        const real* RESTRICT vi = v.row(b, u) + h * hs_;
+                        real* RESTRICT dvi = dv_.row(b, u) + h * hs_;
+                        real dot = 0;
+                        const real w = p[u];
+                        for (int dd = 0; dd < hs_; ++dd) {
+                            dot += dO[dd] * vi[dd];
+                            dvi[dd] += w * dO[dd];
+                        }
+                        dA[u] = dot;
                     }
-                    dA[u] = dot;
                 }
             }
         }
@@ -959,21 +1084,40 @@ public:
 
         // dk accumulates down the key axis the way dv did, so this splits by
         // (batch, head) for the same reason.
+        if (blocked_kernels()) {
+            // dQ = scale * dS K and dK = scale * dS^T Q. ds_ was zeroed by its
+            // resize and only written at u <= t, so the future contributes
+            // nothing to either.
 #pragma omp parallel for schedule(static) if(attn_work >= kMinParallelWork)
-        for (int bh = 0; bh < bh_count; ++bh) {
-            const int b = bh / n_head_;
-            const int h = bh % n_head_;
-            for (int t = 0; t < T; ++t) {
-                const real* RESTRICT ds = ds_.row(bh, t);
-                const real* RESTRICT qi = q.row(b, t) + h * hs_;
-                real* RESTRICT dqi = dq_.row(b, t) + h * hs_;
-                for (int u = 0; u <= t; ++u) {
-                    const real* RESTRICT ki = k.row(b, u) + h * hs_;
-                    real* RESTRICT dki = dk_.row(b, u) + h * hs_;
-                    const real s = ds[u] * scale;
-                    for (int dd = 0; dd < hs_; ++dd) {
-                        dqi[dd] += s * ki[dd];
-                        dki[dd] += s * qi[dd];
+            for (int bh = 0; bh < bh_count; ++bh) {
+                const int b = bh / n_head_;
+                const int h = bh % n_head_;
+                const real* ds = ds_.row(bh, 0);
+                blocked::gemm(false, false, T, hs_, T, scale,
+                    ds, T, k.row(b, 0) + h * hs_, n_embd_,
+                    dq_.row(b, 0) + h * hs_, n_embd_, false);
+                blocked::gemm(true, false, T, hs_, T, scale,
+                    ds, T, q.row(b, 0) + h * hs_, n_embd_,
+                    dk_.row(b, 0) + h * hs_, n_embd_, false);
+            }
+        }
+        else {
+#pragma omp parallel for schedule(static) if(attn_work >= kMinParallelWork)
+            for (int bh = 0; bh < bh_count; ++bh) {
+                const int b = bh / n_head_;
+                const int h = bh % n_head_;
+                for (int t = 0; t < T; ++t) {
+                    const real* RESTRICT ds = ds_.row(bh, t);
+                    const real* RESTRICT qi = q.row(b, t) + h * hs_;
+                    real* RESTRICT dqi = dq_.row(b, t) + h * hs_;
+                    for (int u = 0; u <= t; ++u) {
+                        const real* RESTRICT ki = k.row(b, u) + h * hs_;
+                        real* RESTRICT dki = dk_.row(b, u) + h * hs_;
+                        const real s = ds[u] * scale;
+                        for (int dd = 0; dd < hs_; ++dd) {
+                            dqi[dd] += s * ki[dd];
+                            dki[dd] += s * qi[dd];
+                        }
                     }
                 }
             }
@@ -1226,6 +1370,23 @@ struct Config {
     real dropout;
     real lr;
 };
+
+// Roughly what one training step costs. The forward pass is two multiply-adds
+// per parameter per token and the backward pass is twice that again, which is
+// the standard 6N estimate; the two embedding tables come out because they are
+// lookups rather than matrix multiplies. Attention's own two matmuls are not
+// parameters at all, and at context 256 they stop being a rounding error.
+//
+// Here rather than beside the rest of the cost model in gpt.cpp because
+// gpt_bench.h turns seconds into a rate with it too.
+inline double step_flops(const Config& cfg, size_t params, int vocab) {
+    const double lookups = static_cast<double>(vocab + cfg.block) * cfg.n_embd;
+    const double matmul = static_cast<double>(params) - lookups;
+    const double tokens = static_cast<double>(cfg.batch) * cfg.block;
+    const double attention = 6.0 * cfg.block * (cfg.block + 1.0)
+        * cfg.n_embd * cfg.batch * cfg.n_layer;
+    return 6.0 * matmul * tokens + attention;
+}
 
 // Python:
 //   class GPTLanguageModel(nn.Module):
@@ -1829,8 +1990,9 @@ constexpr int kReportEvery = 1000;
 
 // The scale-up at the end of the video: 10.8M parameters, validation loss 1.48,
 // about fifteen minutes on an A100. It is recorded rather than run - at 6
-// PFLOP for the full schedule it needs the scalar loops in this file blocked
-// and threaded first, which is a separate change.
+// PFLOP for the full schedule it needs more than the threaded scalar loops in
+// this file. Kernels::kBlocked is the next step, and gpt_blocked.cpp measures
+// what it is worth at this width.
 constexpr int kBigEmbed = 384;
 constexpr int kBigHeads = 6;
 constexpr int kBigLayers = 6;

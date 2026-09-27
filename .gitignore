@@ -2,3 +2,5 @@
 .vs
 x64
 *.ckpt
+out
+CMakeUserPresets.json

@@ -47,5 +47,8 @@
     <ClInclude Include="Karpathy\gpt_model.h">
       <Filter>Karpathy</Filter>
     </ClInclude>
+    <ClInclude Include="Karpathy\gpt_gemm.h">
+      <Filter>Karpathy</Filter>
+    </ClInclude>
   </ItemGroup>
 </Project>
