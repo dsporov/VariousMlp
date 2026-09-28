@@ -27,6 +27,9 @@ there for the walkthrough executable.
     lists the members a backend has to provide.
   - `gpt_blocked.cpp`, `gpt_aten.cpp`, `gpt_cuda_main.cpp` with `gpt_cuda.cu`
     and `gpt_cuda.h` - one bench executable per implementation.
+  - `gpt_split.cpp` - a fourth bench: each batch split between `gpt_cuda.cu`
+    and the blocked CPU model, gradients combined on the host. Uses
+    `gpt_cuda.h` unchanged.
   - `gpt_model_plain_cpu.h` - the pre-OpenMP double version. Included by
     nothing; kept for reference.
   - `input.txt`, `names.txt` - the data. Checkpoints (`*.ckpt`, gitignored)
@@ -40,6 +43,7 @@ there for the walkthrough executable.
 | `gpt_blocked` | `gpt_blocked.cpp` | OpenMP if found |
 | `gpt_aten` | `gpt_aten.cpp` | libtorch via `-DCMAKE_PREFIX_PATH`; skipped without it |
 | `gpt_cuda` | `gpt_cuda_main.cpp`, `gpt_cuda.cu` | CUDA 12.x (the GTX 1050 Ti is Pascal, sm_61, which CUDA 13 dropped); skipped without nvcc |
+| `gpt_split` | `gpt_split.cpp`, `gpt_cuda.cu` (compiled again, not shared) | as `gpt_cuda`; skipped with it |
 
 - `gpt_aten` is built without OpenMP on purpose: libtorch brings its own
   runtime, and two runtimes in one process conflict.

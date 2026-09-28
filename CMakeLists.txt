@@ -6,8 +6,9 @@
 #   gpt_blocked  the reference GPT with a cache-blocked, vectorised multiply
 #   gpt_aten     the GPT on ATen tensors; needs libtorch (CMAKE_PREFIX_PATH)
 #   gpt_cuda     the GPT as CUDA kernels; needs a CUDA 12.x toolkit
+#   gpt_split    CUDA and the blocked multiply sharing each batch; needs CUDA too
 #
-# The last two are skipped, with a message, when what they need is missing.
+# The last three are skipped, with a message, when what they need is missing.
 # CMakePresets.json has a Windows/MSVC and a Linux/clang configuration.
 
 cmake_minimum_required(VERSION 3.24)
@@ -31,7 +32,7 @@ option(VARIOUSMLP_NATIVE "Tune for this CPU: -march=native, or /arch:AVX2 on MSV
 option(VARIOUSMLP_FAST_MATH "Let the compiler reorder floating point arithmetic" ON)
 option(VARIOUSMLP_VEC_REPORT "Have the compiler report which loops it vectorised" OFF)
 option(VARIOUSMLP_ATEN "Build gpt_aten if libtorch can be found" ON)
-option(VARIOUSMLP_CUDA "Build gpt_cuda if a CUDA compiler can be found" ON)
+option(VARIOUSMLP_CUDA "Build gpt_cuda and gpt_split if a CUDA compiler can be found" ON)
 
 set(KARPATHY_DIR ${CMAKE_CURRENT_SOURCE_DIR}/VariousMlp/Karpathy)
 
@@ -176,7 +177,24 @@ if(VARIOUSMLP_CUDA)
             ${MODEL_HEADERS})
         variousmlp_setup(gpt_cuda)
         variousmlp_openmp(gpt_cuda)
+
+        # gpt_cuda.cu is compiled a second time rather than shared through a
+        # library, so that gpt_cuda's definition above stays as it was. The
+        # GPU half runs on a std::async thread, which older glibc needs
+        # -pthread for.
+        find_package(Threads)
+        add_executable(gpt_split
+            ${KARPATHY_DIR}/gpt_split.cpp
+            ${KARPATHY_DIR}/gpt_cuda.cu
+            ${KARPATHY_DIR}/gpt_cuda.h
+            ${KARPATHY_DIR}/gpt_bench.h
+            ${MODEL_HEADERS})
+        variousmlp_setup(gpt_split)
+        variousmlp_openmp(gpt_split)
+        if(TARGET Threads::Threads)
+            target_link_libraries(gpt_split PRIVATE Threads::Threads)
+        endif()
     else()
-        message(STATUS "gpt_cuda skipped: no CUDA compiler found")
+        message(STATUS "gpt_cuda and gpt_split skipped: no CUDA compiler found")
     endif()
 endif()
