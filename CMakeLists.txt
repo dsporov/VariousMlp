@@ -7,8 +7,11 @@
 #   gpt_aten     the GPT on ATen tensors; needs libtorch (CMAKE_PREFIX_PATH)
 #   gpt_cuda     the GPT as CUDA kernels; needs a CUDA 12.x toolkit
 #   gpt_split    CUDA and the blocked multiply sharing each batch; needs CUDA too
+#   gpt_scaled   the video's scale-up, trained that way; needs CUDA too. A
+#                project of its own in VariousMlp/GptScaled, with private
+#                copies of every source it compiles
 #
-# The last three are skipped, with a message, when what they need is missing.
+# The last four are skipped, with a message, when what they need is missing.
 # CMakePresets.json has a Windows/MSVC and a Linux/clang configuration.
 
 cmake_minimum_required(VERSION 3.24)
@@ -32,9 +35,10 @@ option(VARIOUSMLP_NATIVE "Tune for this CPU: -march=native, or /arch:AVX2 on MSV
 option(VARIOUSMLP_FAST_MATH "Let the compiler reorder floating point arithmetic" ON)
 option(VARIOUSMLP_VEC_REPORT "Have the compiler report which loops it vectorised" OFF)
 option(VARIOUSMLP_ATEN "Build gpt_aten if libtorch can be found" ON)
-option(VARIOUSMLP_CUDA "Build gpt_cuda and gpt_split if a CUDA compiler can be found" ON)
+option(VARIOUSMLP_CUDA "Build gpt_cuda, gpt_split and gpt_scaled if a CUDA compiler can be found" ON)
 
 set(KARPATHY_DIR ${CMAKE_CURRENT_SOURCE_DIR}/VariousMlp/Karpathy)
+set(SCALED_DIR ${CMAKE_CURRENT_SOURCE_DIR}/VariousMlp/GptScaled)
 
 # The vcxproj uses /openmp:llvm; CMake 3.30 and later can ask for the same
 # runtime, and older versions ignore this and fall back to plain /openmp,
@@ -194,7 +198,24 @@ if(VARIOUSMLP_CUDA)
         if(TARGET Threads::Threads)
             target_link_libraries(gpt_split PRIVATE Threads::Threads)
         endif()
+
+        # Nothing from KARPATHY_DIR is compiled here: GptScaled has its own
+        # copies, so a change to the originals does not reach it. It still
+        # gets VARIOUSMLP_DATA_DIR from variousmlp_setup, which is how it
+        # finds input.txt and where it saves its checkpoint.
+        add_executable(gpt_scaled
+            ${SCALED_DIR}/gpt_scaled.cpp
+            ${SCALED_DIR}/gpt_cuda.cu
+            ${SCALED_DIR}/gpt_cuda.h
+            ${SCALED_DIR}/check.h
+            ${SCALED_DIR}/gpt_model.h
+            ${SCALED_DIR}/gpt_gemm.h)
+        variousmlp_setup(gpt_scaled)
+        variousmlp_openmp(gpt_scaled)
+        if(TARGET Threads::Threads)
+            target_link_libraries(gpt_scaled PRIVATE Threads::Threads)
+        endif()
     else()
-        message(STATUS "gpt_cuda and gpt_split skipped: no CUDA compiler found")
+        message(STATUS "gpt_cuda, gpt_split and gpt_scaled skipped: no CUDA compiler found")
     endif()
 endif()

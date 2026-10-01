@@ -34,6 +34,13 @@ there for the walkthrough executable.
     nothing; kept for reference.
   - `input.txt`, `names.txt` - the data. Checkpoints (`*.ckpt`, gitignored)
     are written next to `input.txt`.
+- `VariousMlp/GptScaled/` - `gpt_scaled.cpp`: the video's full scale-up
+  (context 256, batch 64) trained by CUDA and the blocked CPU multiply sharing
+  each batch, with the GPU's share run in equal chunks so it fits the 1050 Ti's
+  4 GB. A project of its own: `check.h`, `gpt_gemm.h`, `gpt_model.h`,
+  `gpt_cuda.h` and `gpt_cuda.cu` there are copies of the `Karpathy/` files
+  (a note added at the top, otherwise unchanged), and nothing in it includes
+  `Karpathy/`. It reads `Karpathy/input.txt` and saves its checkpoint there.
 
 ## Targets
 
@@ -44,7 +51,11 @@ there for the walkthrough executable.
 | `gpt_aten` | `gpt_aten.cpp` | libtorch via `-DCMAKE_PREFIX_PATH`; skipped without it |
 | `gpt_cuda` | `gpt_cuda_main.cpp`, `gpt_cuda.cu` | CUDA 12.x (the GTX 1050 Ti is Pascal, sm_61, which CUDA 13 dropped); skipped without nvcc |
 | `gpt_split` | `gpt_split.cpp`, `gpt_cuda.cu` (compiled again, not shared) | as `gpt_cuda`; skipped with it |
+| `gpt_scaled` | `GptScaled/gpt_scaled.cpp`, `GptScaled/gpt_cuda.cu`, and its own copies of the headers | as `gpt_cuda`; skipped with it |
 
+- Projects stay independent. A new one gets its own directory and its own
+  copies of what it needs rather than sharing files with another; duplicated
+  code is fine, coupling between projects is not. `GptScaled/` is the model.
 - `gpt_aten` is built without OpenMP on purpose: libtorch brings its own
   runtime, and two runtimes in one process conflict.
 - Everything is C++20, because recent libtorch headers need it: CMake sets it
