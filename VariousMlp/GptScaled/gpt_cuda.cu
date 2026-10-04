@@ -1,8 +1,9 @@
-// GptScaled's own copy of Karpathy/gpt_cuda.cu, taken at commit 512eaaa and
-// otherwise unchanged, so that the two diff cleanly. gpt_scaled compiles only
-// the files in this directory, which keeps it independent of Karpathy/: a
-// change on either side stays on that side. Where the comments below mention
-// other files, they mean the ones in Karpathy/.
+// GptScaled's own copy of Karpathy/gpt_cuda.cu, taken at commit 512eaaa. The
+// one change since, the mixed dropout seeds in drop(), went into both copies,
+// so the two still diff cleanly. gpt_scaled compiles only the files in this
+// directory, which keeps it independent of Karpathy/: a change on either side
+// stays on that side. Where the comments below mention other files, they mean
+// the ones in Karpathy/.
 //
 // gpt_cuda.cu - the model on the GPU, every forward and backward pass a kernel.
 //
@@ -578,14 +579,18 @@ __global__ void relu_backward(float* __restrict__ d, const float* __restrict__ o
     }
 }
 
-// splitmix64's finaliser over (seed, index): a well-mixed 64-bit value per
-// element with no state to share, of which the top 24 bits make a float in
-// [0, 1).
-__device__ inline float uniform01(unsigned long long seed, unsigned long long i) {
-    unsigned long long z = seed + (i + 1ull) * kGolden;
+// splitmix64's finaliser: every bit of the input reaches every bit of the
+// output. On the host as well, because drop() mixes its seeds with it.
+__host__ __device__ inline unsigned long long mix64(unsigned long long z) {
     z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
     z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
-    z ^= z >> 31;
+    return z ^ (z >> 31);
+}
+
+// A well-mixed 64-bit value per (seed, index) with no state to share, of
+// which the top 24 bits make a float in [0, 1).
+__device__ inline float uniform01(unsigned long long seed, unsigned long long i) {
+    const unsigned long long z = mix64(seed + (i + 1ull) * kGolden);
     return static_cast<float>(z >> 40) * (1.0f / 16777216.0f);
 }
 
@@ -911,8 +916,16 @@ struct Model::Impl {
             return x;
         }
         ++draws;
+        // uniform01 hashes seed + (i + 1) * kGolden, so seeds that are
+        // themselves kGolden apart make every mask the one before it shifted
+        // by one element: a block's feed-forward mask would be its attention
+        // output's one channel along, and each step's masks the last step's a
+        // few dozen along. Mixed, the seeds are unrelated, and two masks
+        // overlap only if theirs happen to differ by fewer than n multiples
+        // of kGolden - for the largest mask, about one chance in 10^12.
+        const unsigned long long seed = mix64(kDropoutSeed + draws * kGolden);
         dropout_forward<<<blocks_for(n, kThreads), kThreads>>>(x, out.get(), mask.get(),
-            n, s.dropout, 1.0f / (1.0f - s.dropout), kDropoutSeed + draws * kGolden);
+            n, s.dropout, 1.0f / (1.0f - s.dropout), seed);
         CHECK_LAUNCH();
         return out.get();
     }
