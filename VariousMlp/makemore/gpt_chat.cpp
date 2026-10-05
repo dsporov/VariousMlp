@@ -167,7 +167,7 @@ void test_gpt_chat() {
     Data d;
     if (!load_corpus(d)) {
         printf("could not find %s - expected it next to gpt_chat.cpp in "
-            "Karpathy/\n", kCorpus);
+            "makemore/\n", kCorpus);
         return;
     }
 

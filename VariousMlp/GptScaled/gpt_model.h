@@ -1,8 +1,8 @@
-// GptScaled's own copy of Karpathy/gpt_model.h, taken at commit 512eaaa and
+// GptScaled's own copy of makemore/gpt_model.h, taken at commit 512eaaa and
 // otherwise unchanged, so that the two diff cleanly. gpt_scaled compiles only
-// the files in this directory, which keeps it independent of Karpathy/: a
+// the files in this directory, which keeps it independent of makemore/: a
 // change on either side stays on that side. Where the comments below mention
-// other files, they mean the ones in Karpathy/.
+// other files, they mean the ones in makemore/.
 //
 // gpt_model.h - the Transformer itself, shared by every file that uses it.
 //
@@ -239,10 +239,10 @@ inline bool load_corpus(Data& d) {
 #ifdef VARIOUSMLP_DATA_DIR
         VARIOUSMLP_DATA_DIR "/",
 #endif
-        "Karpathy/",
+        "makemore/",
         "",
-        "VariousMlp/Karpathy/",
-        "../../VariousMlp/Karpathy/",
+        "VariousMlp/makemore/",
+        "../../VariousMlp/makemore/",
     };
 
     std::string text;

@@ -39,9 +39,9 @@
 // and the split moves toward where both sides finish together.
 //
 // This directory is a project of its own. check.h, gpt_gemm.h, gpt_model.h,
-// gpt_cuda.h and gpt_cuda.cu are copies of the files in Karpathy/, and
+// gpt_cuda.h and gpt_cuda.cu are copies of the files in makemore/, and
 // nothing here includes anything from there. It touches the rest of the
-// repository only through files on disk: it reads Karpathy/input.txt, and it
+// repository only through files on disk: it reads makemore/input.txt, and it
 // saves the trained weights beside it in gpt_model.h's checkpoint format,
 // under gpt_model.h's name for this shape - the file gpt.cpp's scale-up
 // branch looks for, and one the chat tool can read.
@@ -785,7 +785,7 @@ int main() {
         std::cout << "\n== 0. tiny shakespeare ==\n";
         Data d;
         if (!load_corpus(d)) {
-            printf("  could not find %s - expected it in Karpathy/\n", kCorpus);
+            printf("  could not find %s - expected it in makemore/\n", kCorpus);
             return 1;
         }
         printf("  vocabulary of %d characters, %zu training tokens\n", d.vocab,

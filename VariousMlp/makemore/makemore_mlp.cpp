@@ -78,10 +78,10 @@ std::vector<std::string> load_names() {
 #ifdef VARIOUSMLP_DATA_DIR
         VARIOUSMLP_DATA_DIR "/names.txt",
 #endif
-        "Karpathy/names.txt",
+        "makemore/names.txt",
         "names.txt",
-        "VariousMlp/Karpathy/names.txt",
-        "../../VariousMlp/Karpathy/names.txt",
+        "VariousMlp/makemore/names.txt",
+        "../../VariousMlp/makemore/names.txt",
     };
 
     for (const char* path : kCandidates) {
@@ -783,7 +783,7 @@ void test_makemore_mlp() {
     const std::vector<std::string> words = load_names();
     if (words.empty()) {
         std::cout << "  could not find names.txt - expected it next to "
-            "makemore_mlp.cpp in Karpathy/\n";
+            "makemore_mlp.cpp in makemore/\n";
         return;
     }
     printf("  %zu names, %d characters of context per example\n", words.size(), kBlock);

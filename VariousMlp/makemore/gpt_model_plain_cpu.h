@@ -128,10 +128,10 @@ inline bool load_corpus(Data& d) {
     // cwd = $(ProjectDir), a bare exe run has cwd = x64\Debug, and running from
     // the repo root is the other common case.
     static const char* kDirs[] = {
-        "Karpathy/",
+        "makemore/",
         "",
-        "VariousMlp/Karpathy/",
-        "../../VariousMlp/Karpathy/",
+        "VariousMlp/makemore/",
+        "../../VariousMlp/makemore/",
     };
 
     std::string text;

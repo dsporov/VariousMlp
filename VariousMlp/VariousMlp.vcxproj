@@ -139,18 +139,18 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClCompile Include="Karpathy\makemore_batchnorm.cpp" />
-    <ClCompile Include="Karpathy\makemore_bigram.cpp" />
-    <ClCompile Include="Karpathy\makemore_mlp.cpp" />
-    <ClCompile Include="Karpathy\gpt.cpp" />
-    <ClCompile Include="Karpathy\gpt_chat.cpp" />
-    <ClCompile Include="Karpathy\micrograd.cpp" />
+    <ClCompile Include="makemore\makemore_batchnorm.cpp" />
+    <ClCompile Include="makemore\makemore_bigram.cpp" />
+    <ClCompile Include="makemore\makemore_mlp.cpp" />
+    <ClCompile Include="makemore\gpt.cpp" />
+    <ClCompile Include="makemore\gpt_chat.cpp" />
+    <ClCompile Include="makemore\micrograd.cpp" />
     <ClCompile Include="VariousMlp.cpp" />
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="Karpathy\check.h" />
-    <ClInclude Include="Karpathy\gpt_model.h" />
-    <ClInclude Include="Karpathy\gpt_gemm.h" />
+    <ClInclude Include="makemore\check.h" />
+    <ClInclude Include="makemore\gpt_model.h" />
+    <ClInclude Include="makemore\gpt_gemm.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

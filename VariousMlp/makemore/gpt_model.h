@@ -233,10 +233,10 @@ inline bool load_corpus(Data& d) {
 #ifdef VARIOUSMLP_DATA_DIR
         VARIOUSMLP_DATA_DIR "/",
 #endif
-        "Karpathy/",
+        "makemore/",
         "",
-        "VariousMlp/Karpathy/",
-        "../../VariousMlp/Karpathy/",
+        "VariousMlp/makemore/",
+        "../../VariousMlp/makemore/",
     };
 
     std::string text;

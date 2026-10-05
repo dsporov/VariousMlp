@@ -14,7 +14,7 @@ there for the walkthrough executable.
   into `out/build/<preset>/` (gitignored).
 - `VariousMlp/VariousMlp.cpp` - `main` for the walkthroughs. The calls in it
   pick which one runs; `VariousMlp chat` starts the prompt in `gpt_chat.cpp`.
-- `VariousMlp/Karpathy/` - one `.cpp` per video, plus the GPT's supporting
+- `VariousMlp/makemore/` - one `.cpp` per video, plus the GPT's supporting
   files:
   - `gpt_model.h` - the reference GPT. Used by `gpt.cpp`, `gpt_chat.cpp` and
     every bench.
@@ -38,9 +38,9 @@ there for the walkthrough executable.
   (context 256, batch 64) trained by CUDA and the blocked CPU multiply sharing
   each batch, with the GPU's share run in equal chunks so it fits the 1050 Ti's
   4 GB. A project of its own: `check.h`, `gpt_gemm.h`, `gpt_model.h`,
-  `gpt_cuda.h` and `gpt_cuda.cu` there are copies of the `Karpathy/` files
+  `gpt_cuda.h` and `gpt_cuda.cu` there are copies of the `makemore/` files
   (a note added at the top, otherwise unchanged), and nothing in it includes
-  `Karpathy/`. It reads `Karpathy/input.txt` and saves its checkpoint there.
+  `makemore/`. It reads `makemore/input.txt` and saves its checkpoint there.
 
 ## Targets
 
@@ -64,7 +64,7 @@ there for the walkthrough executable.
 - `gpt_cuda.h` is plain C++ so that nvcc never compiles `gpt_model.h`. Keep it
   that way: CUDA types stay in `gpt_cuda.cu`.
 - The CMake build defines `VARIOUSMLP_DATA_DIR` (absolute path of
-  `Karpathy/`), so the data is found from any working directory. The vcxproj
+  `makemore/`), so the data is found from any working directory. The vcxproj
   build does not define it and falls back to relative paths. Keep both
   working.
 
@@ -113,7 +113,7 @@ for (int i = 0; i < n; ++i) { sum += x[i]; }
 
 ## Sanity checks
 
-`Karpathy/check.h` holds the two check flavours these files use:
+`makemore/check.h` holds the two check flavours these files use:
 
 - `CHECK(cond, msg)` for structural invariants. It throws, and stays on in
   Release on purpose. Keep it out of inner arithmetic loops. CUDA API failures

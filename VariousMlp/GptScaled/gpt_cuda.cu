@@ -1,9 +1,9 @@
-// GptScaled's own copy of Karpathy/gpt_cuda.cu, taken at commit 512eaaa. The
+// GptScaled's own copy of makemore/gpt_cuda.cu, taken at commit 512eaaa. The
 // one change since, the mixed dropout seeds in drop(), went into both copies,
 // so the two still diff cleanly. gpt_scaled compiles only the files in this
-// directory, which keeps it independent of Karpathy/: a change on either side
+// directory, which keeps it independent of makemore/: a change on either side
 // stays on that side. Where the comments below mention other files, they mean
-// the ones in Karpathy/.
+// the ones in makemore/.
 //
 // gpt_cuda.cu - the model on the GPU, every forward and backward pass a kernel.
 //

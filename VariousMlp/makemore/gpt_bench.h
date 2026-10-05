@@ -245,7 +245,7 @@ inline void print_config(const Config& cfg) {
 inline bool load_data(Data& d) {
     std::cout << "== 0. tiny shakespeare ==\n";
     if (!load_corpus(d)) {
-        printf("  could not find %s - expected it in Karpathy/\n", kCorpus);
+        printf("  could not find %s - expected it in makemore/\n", kCorpus);
         return false;
     }
     printf("  vocabulary of %d characters, %zu training tokens\n",

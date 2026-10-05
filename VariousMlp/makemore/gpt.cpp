@@ -428,7 +428,7 @@ void test_gpt() {
     std::cout << "== 0. tiny shakespeare ==\n";
     Data d;
     if (!load_corpus(d)) {
-        printf("  could not find %s - expected it next to gpt.cpp in Karpathy/\n",
+        printf("  could not find %s - expected it next to gpt.cpp in makemore/\n",
             kCorpus);
         return;
     }

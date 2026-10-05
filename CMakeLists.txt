@@ -37,7 +37,7 @@ option(VARIOUSMLP_VEC_REPORT "Have the compiler report which loops it vectorised
 option(VARIOUSMLP_ATEN "Build gpt_aten if libtorch can be found" ON)
 option(VARIOUSMLP_CUDA "Build gpt_cuda, gpt_split and gpt_scaled if a CUDA compiler can be found" ON)
 
-set(KARPATHY_DIR ${CMAKE_CURRENT_SOURCE_DIR}/VariousMlp/Karpathy)
+set(MAKEMORE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/VariousMlp/makemore)
 set(SCALED_DIR ${CMAKE_CURRENT_SOURCE_DIR}/VariousMlp/GptScaled)
 
 # The vcxproj uses /openmp:llvm; CMake 3.30 and later can ask for the same
@@ -52,7 +52,7 @@ function(variousmlp_setup target)
     # The programs find input.txt and names.txt relative to a few working
     # directories a Visual Studio run might have; a build tree is none of
     # them, so the data directory is compiled in.
-    target_compile_definitions(${target} PRIVATE VARIOUSMLP_DATA_DIR="${KARPATHY_DIR}")
+    target_compile_definitions(${target} PRIVATE VARIOUSMLP_DATA_DIR="${MAKEMORE_DIR}")
     if(MSVC)
         target_compile_options(${target} PRIVATE
             $<$<COMPILE_LANGUAGE:CXX>:/W3>
@@ -105,26 +105,26 @@ if(NOT OpenMP_CXX_FOUND)
 endif()
 
 set(MODEL_HEADERS
-    ${KARPATHY_DIR}/check.h
-    ${KARPATHY_DIR}/gpt_model.h
-    ${KARPATHY_DIR}/gpt_gemm.h)
+    ${MAKEMORE_DIR}/check.h
+    ${MAKEMORE_DIR}/gpt_model.h
+    ${MAKEMORE_DIR}/gpt_gemm.h)
 
 # The walkthroughs. The same sources as VariousMlp.vcxproj.
 add_executable(VariousMlp
     VariousMlp/VariousMlp.cpp
-    ${KARPATHY_DIR}/micrograd.cpp
-    ${KARPATHY_DIR}/makemore_bigram.cpp
-    ${KARPATHY_DIR}/makemore_mlp.cpp
-    ${KARPATHY_DIR}/makemore_batchnorm.cpp
-    ${KARPATHY_DIR}/gpt.cpp
-    ${KARPATHY_DIR}/gpt_chat.cpp
+    ${MAKEMORE_DIR}/micrograd.cpp
+    ${MAKEMORE_DIR}/makemore_bigram.cpp
+    ${MAKEMORE_DIR}/makemore_mlp.cpp
+    ${MAKEMORE_DIR}/makemore_batchnorm.cpp
+    ${MAKEMORE_DIR}/gpt.cpp
+    ${MAKEMORE_DIR}/gpt_chat.cpp
     ${MODEL_HEADERS})
 variousmlp_setup(VariousMlp)
 variousmlp_openmp(VariousMlp)
 
 add_executable(gpt_blocked
-    ${KARPATHY_DIR}/gpt_blocked.cpp
-    ${KARPATHY_DIR}/gpt_bench.h
+    ${MAKEMORE_DIR}/gpt_blocked.cpp
+    ${MAKEMORE_DIR}/gpt_bench.h
     ${MODEL_HEADERS})
 variousmlp_setup(gpt_blocked)
 variousmlp_openmp(gpt_blocked)
@@ -133,8 +133,8 @@ if(VARIOUSMLP_ATEN)
     find_package(Torch QUIET)
     if(Torch_FOUND)
         add_executable(gpt_aten
-            ${KARPATHY_DIR}/gpt_aten.cpp
-            ${KARPATHY_DIR}/gpt_bench.h
+            ${MAKEMORE_DIR}/gpt_aten.cpp
+            ${MAKEMORE_DIR}/gpt_bench.h
             ${MODEL_HEADERS})
         variousmlp_setup(gpt_aten)
         # Deliberately no OpenMP: libtorch brings its own runtime, and two in
@@ -174,10 +174,10 @@ if(VARIOUSMLP_CUDA)
         set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
         add_executable(gpt_cuda
-            ${KARPATHY_DIR}/gpt_cuda_main.cpp
-            ${KARPATHY_DIR}/gpt_cuda.cu
-            ${KARPATHY_DIR}/gpt_cuda.h
-            ${KARPATHY_DIR}/gpt_bench.h
+            ${MAKEMORE_DIR}/gpt_cuda_main.cpp
+            ${MAKEMORE_DIR}/gpt_cuda.cu
+            ${MAKEMORE_DIR}/gpt_cuda.h
+            ${MAKEMORE_DIR}/gpt_bench.h
             ${MODEL_HEADERS})
         variousmlp_setup(gpt_cuda)
         variousmlp_openmp(gpt_cuda)
@@ -188,10 +188,10 @@ if(VARIOUSMLP_CUDA)
         # -pthread for.
         find_package(Threads)
         add_executable(gpt_split
-            ${KARPATHY_DIR}/gpt_split.cpp
-            ${KARPATHY_DIR}/gpt_cuda.cu
-            ${KARPATHY_DIR}/gpt_cuda.h
-            ${KARPATHY_DIR}/gpt_bench.h
+            ${MAKEMORE_DIR}/gpt_split.cpp
+            ${MAKEMORE_DIR}/gpt_cuda.cu
+            ${MAKEMORE_DIR}/gpt_cuda.h
+            ${MAKEMORE_DIR}/gpt_bench.h
             ${MODEL_HEADERS})
         variousmlp_setup(gpt_split)
         variousmlp_openmp(gpt_split)
@@ -199,7 +199,7 @@ if(VARIOUSMLP_CUDA)
             target_link_libraries(gpt_split PRIVATE Threads::Threads)
         endif()
 
-        # Nothing from KARPATHY_DIR is compiled here: GptScaled has its own
+        # Nothing from MAKEMORE_DIR is compiled here: GptScaled has its own
         # copies, so a change to the originals does not reach it. It still
         # gets VARIOUSMLP_DATA_DIR from variousmlp_setup, which is how it
         # finds input.txt and where it saves its checkpoint.

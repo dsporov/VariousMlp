@@ -13,7 +13,7 @@
       <UniqueIdentifier>{67DA6AB6-F800-4c08-8B7A-83BB121AAD01}</UniqueIdentifier>
       <Extensions>rc;ico;cur;bmp;dlg;rc2;rct;bin;rgs;gif;jpg;jpeg;jpe;resx;tiff;tif;png;wav;mfcribbon-ms</Extensions>
     </Filter>
-    <Filter Include="Karpathy">
+    <Filter Include="makemore">
       <UniqueIdentifier>{eedf7a03-c29f-4d9c-8cf6-a74476a7efb4}</UniqueIdentifier>
     </Filter>
   </ItemGroup>
@@ -21,34 +21,34 @@
     <ClCompile Include="VariousMlp.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="Karpathy\micrograd.cpp">
-      <Filter>Karpathy</Filter>
+    <ClCompile Include="makemore\micrograd.cpp">
+      <Filter>makemore</Filter>
     </ClCompile>
-    <ClCompile Include="Karpathy\makemore_bigram.cpp">
-      <Filter>Karpathy</Filter>
+    <ClCompile Include="makemore\makemore_bigram.cpp">
+      <Filter>makemore</Filter>
     </ClCompile>
-    <ClCompile Include="Karpathy\makemore_mlp.cpp">
-      <Filter>Karpathy</Filter>
+    <ClCompile Include="makemore\makemore_mlp.cpp">
+      <Filter>makemore</Filter>
     </ClCompile>
-    <ClCompile Include="Karpathy\makemore_batchnorm.cpp">
-      <Filter>Karpathy</Filter>
+    <ClCompile Include="makemore\makemore_batchnorm.cpp">
+      <Filter>makemore</Filter>
     </ClCompile>
-    <ClCompile Include="Karpathy\gpt.cpp">
-      <Filter>Karpathy</Filter>
+    <ClCompile Include="makemore\gpt.cpp">
+      <Filter>makemore</Filter>
     </ClCompile>
-    <ClCompile Include="Karpathy\gpt_chat.cpp">
-      <Filter>Karpathy</Filter>
+    <ClCompile Include="makemore\gpt_chat.cpp">
+      <Filter>makemore</Filter>
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="Karpathy\check.h">
-      <Filter>Karpathy</Filter>
+    <ClInclude Include="makemore\check.h">
+      <Filter>makemore</Filter>
     </ClInclude>
-    <ClInclude Include="Karpathy\gpt_model.h">
-      <Filter>Karpathy</Filter>
+    <ClInclude Include="makemore\gpt_model.h">
+      <Filter>makemore</Filter>
     </ClInclude>
-    <ClInclude Include="Karpathy\gpt_gemm.h">
-      <Filter>Karpathy</Filter>
+    <ClInclude Include="makemore\gpt_gemm.h">
+      <Filter>makemore</Filter>
     </ClInclude>
   </ItemGroup>
 </Project>

@@ -1,8 +1,8 @@
-// GptScaled's own copy of Karpathy/gpt_cuda.h, taken at commit 512eaaa and
+// GptScaled's own copy of makemore/gpt_cuda.h, taken at commit 512eaaa and
 // otherwise unchanged, so that the two diff cleanly. gpt_scaled compiles only
-// the files in this directory, which keeps it independent of Karpathy/: a
+// the files in this directory, which keeps it independent of makemore/: a
 // change on either side stays on that side. Where the comments below mention
-// other files, they mean the ones in Karpathy/.
+// other files, they mean the ones in makemore/.
 //
 // gpt_cuda.h - the host side of the model in gpt_cuda.cu.
 //

@@ -11,7 +11,7 @@ void test_gpt_chat();
 
 int main(int argc, char** argv)
 {
-    // The hard checks (CHECK in Karpathy/check.h) throw, so catch them here and
+    // The hard checks (CHECK in makemore/check.h) throw, so catch them here and
     // print the file:line instead of letting the runtime pop a dialog.
     try {
         // The walkthroughs take minutes and end by training a model; the prompt
