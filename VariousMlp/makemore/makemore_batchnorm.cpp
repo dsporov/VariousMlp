@@ -2,33 +2,35 @@
 // ("Building makemore Part 3: Activations & Gradients, BatchNorm", video 4 of
 //  Neural Networks: Zero to Hero)
 //
-// The previous video built a network that works and left two things
-// unexamined. Its loss starts at about 27 where a model that knows nothing at
-// all should score 3.30, and its hidden tanh is pinned flat at -1 and +1
-// before a single step is taken. Neither stops the net from learning; they
-// waste the first thousand steps and most of the hidden units. This video is
-// about seeing both from the inside and then fixing them.
+// The previous video built a network that works, but it did not examine two
+// problems. Its loss starts at about 27, where a model that knows nothing at
+// all should score 3.30. And its hidden tanh outputs are stuck at -1 and +1
+// before the first training step. Neither problem stops the net from
+// learning, but together they waste the first thousand steps and most of the
+// hidden units. This video looks at both problems from the inside, and then
+// fixes them.
 //
 // What it covers, in order:
-//   1. why randn weights leave the output layer confidently wrong
+//   1. why randn weights make the output layer confidently wrong
 //   2. why the same weights saturate tanh, and what a dead neuron is
-//   3. Kaiming init - gain / sqrt(fan_in) - the principled version of the two
-//      hand-picked multipliers that fix 1 and 2
-//   4. batch normalisation, which normalises the preactivations instead of
-//      arranging for them to arrive normalised
+//   3. Kaiming init, gain / sqrt(fan_in): the principled version of the two
+//      hand-picked factors that fix 1 and 2
+//   4. batch normalisation, which normalises the preactivations directly,
+//      instead of choosing weights so that they come out normalised
 //   5. the diagnostics (activation, gradient, grad:data and update:data
-//      statistics per layer) that make all of this visible on a deeper net
+//      statistics per layer) that make all of this visible in a deeper net
 //
-// The port is not a continuation of makemore_mlp.cpp but a rewrite of it,
-// because batch normalisation is the first thing in the series that looks down
-// a column of the batch rather than along a row. A per-example forward pass
-// cannot express it, so everything below moves a whole minibatch at a time.
+// This port is not a continuation of makemore_mlp.cpp but a rewrite of it.
+// Batch normalisation is the first operation in the series that works down a
+// column of the batch, not along a row. A forward pass per example cannot
+// express it, so everything below processes a whole minibatch at a time.
 //
 // Needs names.txt (32033 names, one per line) next to this file.
 //
-// Section 6 trains five networks of kSteps minibatches each, which is a few
-// minutes in Release and far worse in Debug. Lower kSteps while iterating - the
-// ordering of the five settles long before their losses do.
+// Section 6 trains five networks of kSteps minibatches each. That takes a few
+// minutes in Release and much longer in Debug. Lower kSteps if you run it
+// often: the order of the five networks is clear long before their losses
+// are final.
 
 #include <algorithm>
 #include <chrono>
@@ -53,10 +55,10 @@ namespace {
 constexpr int kVocab = 27;    // '.' plus the 26 lowercase letters
 constexpr int kBlock = 3;     // characters of context the model gets to see
 
-// encode, decode, load_names and build_dataset are a copy of the ones in
-// makemore_mlp.cpp for the same reason that file copies them from
-// makemore_bigram.cpp: each video's file is meant to be read start to finish
-// on its own, the way each video is watched.
+// encode, decode, load_names and build_dataset are copies of the ones in
+// makemore_mlp.cpp, for the same reason that file copies them from
+// makemore_bigram.cpp: each video's file is meant to be read from start to
+// finish on its own, in the same way as each video is watched.
 //
 // Python:
 //   chars = sorted(list(set(''.join(words))))
@@ -77,11 +79,12 @@ inline char decode(int i) {
 
 // Python: words = open('names.txt', 'r').read().splitlines()
 std::vector<std::string> load_names() {
-    // Relative to a few plausible working directories: Visual Studio runs with
-    // cwd = $(ProjectDir), a bare exe run has cwd = x64\Debug, and running from
-    // the repo root is the other common case. A CMake build runs from somewhere
-    // in its build tree, which none of those reach, so it names the directory
-    // outright and that goes first.
+    // The data is searched for relative to a few likely working directories.
+    // Visual Studio runs with cwd = $(ProjectDir), a run of the exe on its own
+    // has cwd = x64\Debug, and running from the repo root is the other common
+    // case. A CMake build runs from somewhere in its build tree, which none of
+    // these paths reach. So CMake defines the directory explicitly, and it is
+    // tried first.
     static const char* kCandidates[] = {
 #ifdef VARIOUSMLP_DATA_DIR
         VARIOUSMLP_DATA_DIR "/names.txt",
@@ -108,8 +111,8 @@ std::vector<std::string> load_names() {
             if (line.back() == '\r') {
                 line.pop_back();  // CRLF
             }
-            // The model has exactly 27 tokens, so a stray uppercase letter,
-            // digit or accent has nowhere to go.
+            // The model has exactly 27 tokens, so an unexpected uppercase
+            // letter, digit or accented letter has no token.
             const bool clean = std::all_of(line.begin(), line.end(),
                 [](char c) { return c >= 'a' && c <= 'z'; });
             if (clean) {
@@ -130,8 +133,9 @@ std::vector<std::string> load_names() {
     return {};
 }
 
-// One example per (context, next character) pair: xs holds kBlock token ids
-// per example laid end to end, ys the single id that follows them.
+// One example per (context, next character) pair. xs holds kBlock token ids
+// per example, one example after another; ys holds the one id that follows
+// each context.
 struct Dataset {
     std::vector<int> xs;
     std::vector<int> ys;
@@ -174,9 +178,10 @@ Dataset build_dataset(const std::vector<std::string>& words) {
     return d;
 }
 
-// Every token in here becomes a raw offset into the embedding table, so a bad
-// one is an out-of-bounds read rather than a wrong answer. One pass per split
-// before training starts; the training loop itself stays check-free.
+// Every token here becomes a raw offset into the embedding table, so a bad
+// token would be an out-of-bounds read, not just a wrong answer. This is one
+// pass per split before training starts, so the training loop itself needs no
+// checks.
 void validate_dataset(const Dataset& d, const char* what) {
     CHECK(d.size() > 0, what << ": no examples");
     CHECK(d.xs.size() == d.size() * kBlock,
@@ -195,8 +200,8 @@ void validate_dataset(const Dataset& d, const char* what) {
     }
 }
 
-// Splitting by name rather than by example, for the same reason as last video:
-// every example cut from one name shares its letters.
+// The split is by name, not by example, for the same reason as in the last
+// video: all examples from one name share its letters.
 //
 // Python:
 //   random.seed(42)
@@ -223,21 +228,21 @@ Splits split_words(std::vector<std::string> words, std::mt19937& g) {
 }
 
 // ---------------------------------------------------------------------------
-// A batch, and the layers that move one
+// A batch, and the layers that process one
 // ---------------------------------------------------------------------------
 
 // Rows are examples, columns are features. Batch normalisation is the reason
-// this type exists: mean and variance are taken down a column, across the
-// examples, which is the first operation in the series that makes one
-// example's output depend on the other 31 in its batch.
+// this type exists: mean and variance are computed down a column, across the
+// examples. It is the first operation in the series that makes one example's
+// output depend on the other 31 examples in its batch.
 struct Matrix {
     int rows = 0;
     int cols = 0;
     std::vector<double> v;
 
-    // Always zero-fills. Layers that overwrite every element do not need that,
-    // but it costs a fraction of one matrix multiply and it means a half-filled
-    // buffer can never be read as data.
+    // Always fills with zeros. Layers that overwrite every element do not need
+    // that, but it costs only a fraction of one matrix multiply, and a
+    // half-filled buffer can then never be read as data.
     void resize(int r, int c) {
         rows = r;
         cols = c;
@@ -248,9 +253,9 @@ struct Matrix {
     const double* row(int i) const { return &v[static_cast<size_t>(i) * cols]; }
 };
 
-// A parameter and its gradient, side by side. The video's flat `parameters`
-// list is exactly this: the thing the optimiser steps and the diagnostics
-// measure, with the layer it came from deliberately forgotten.
+// A parameter and its gradient, together. The video's flat `parameters` list
+// is exactly this: what the optimiser updates and the diagnostics measure,
+// without the layer it belongs to, on purpose.
 struct Param {
     std::string name;
     std::vector<double>* data;
@@ -263,10 +268,10 @@ struct Param {
 //           self.out = x @ self.weight
 //           ...
 //
-// Every layer keeps its own output, which is not an implementation detail: the
-// activation histograms in sections 1-5 and the per-layer statistics in section
-// 7 are all reads of `.out` after a forward pass. backward() is non-virtual so
-// that it can record the incoming gradient for the same reason.
+// Every layer keeps its own output, and that is not an implementation detail:
+// the activation histograms in sections 1-5 and the per-layer statistics in
+// section 7 all read `.out` after a forward pass. For the same reason,
+// backward() is not virtual, so that it can record the incoming gradient.
 class Layer {
 public:
     virtual ~Layer() = default;
@@ -283,8 +288,8 @@ public:
 
     const Matrix& out() const { return out_; }
 
-    // d(loss)/d(this layer's output), i.e. the video's `layer.out.grad`. Null
-    // until the first backward pass, and only valid until the next one.
+    // d(loss)/d(this layer's output), i.e. the video's `layer.out.grad`. It is
+    // null until the first backward pass, and only valid until the next one.
     const Matrix* dout() const { return dout_; }
 
 protected:
@@ -301,10 +306,10 @@ protected:
 //           self.weight = torch.randn((fan_in, fan_out), generator=g) / fan_in**0.5
 //           self.bias = torch.zeros(fan_out) if bias else None
 //
-// weight_scale is the one knob the first half of the video turns. 1.0 is the
-// naive init from part 2, 0.01 is the squashed output layer, 0.2 is the
-// hand-picked hidden layer, and gain / sqrt(fan_in) is Kaiming - all four are
-// the same line with a different number in front of it.
+// weight_scale is the one setting that the first half of the video changes.
+// 1.0 is the naive init from part 2, 0.01 is the scaled-down output layer, 0.2
+// is the hand-picked hidden layer, and gain / sqrt(fan_in) is Kaiming. All
+// four are the same line with a different number in front of it.
 class Linear : public Layer {
 public:
     Linear(int fan_in, int fan_out, double weight_scale, double bias_scale,
@@ -322,10 +327,11 @@ public:
         for (double& v : w_) {
             v = randn(g) * weight_scale;
         }
-        // A zero scale means the video's torch.zeros rather than a scaled draw,
-        // so no numbers come out of the generator. That keeps the random stream
-        // aligned between two recipes that differ only in whether the bias
-        // exists, which is what makes section 6 a like-for-like comparison.
+        // A zero scale means the video's torch.zeros, not a scaled random
+        // draw, so no numbers are taken from the generator. Then two recipes
+        // that differ only in whether the bias exists still get the same
+        // random numbers for everything else. That is what makes section 6 a
+        // fair comparison.
         if (bias_scale != 0.0) {
             for (double& v : b_) {
                 v = randn(g) * bias_scale;
@@ -342,9 +348,9 @@ public:
         CHECK(x.cols == fan_in_, "a " << fan_in_ << "-wide layer was handed "
             << x.cols << " inputs");
 
-        // A pointer rather than a copy: the layer that produced x owns it and
-        // does not touch it again until the next forward pass, by which time
-        // this layer's backward has already run.
+        // A pointer, not a copy. The layer that produced x owns it, and does
+        // not change it until the next forward pass. By then, this layer's
+        // backward pass has already run.
         x_ = &x;
         out_.resize(x.rows, fan_out_);
         for (int i = 0; i < x.rows; ++i) {
@@ -427,9 +433,9 @@ public:
     }
 
 protected:
-    // tanh' = 1 - tanh^2, and out_ already holds the tanh. The whole subject of
-    // the video is in that factor: at |out| near 1 it is near 0, and the layer
-    // stops passing anything back.
+    // tanh' = 1 - tanh^2, and out_ already holds the tanh. The whole subject
+    // of the video is in that factor: when |out| is near 1, the factor is near
+    // 0, and almost no gradient passes back through the layer.
     const Matrix& backward_impl(const Matrix& dout) override {
         dx_.resize(out_.rows, out_.cols);
         for (size_t k = 0; k < dout.v.size(); ++k) {
@@ -457,8 +463,8 @@ protected:
 //                   self.running_var = (1 - m) * self.running_var + m * xvar
 //           return self.out
 //
-// torch.var is unbiased by default, so the division below is by n-1 and not n.
-// That choice leaks into the backward pass, where it shows up as the n/(n-1)
+// torch.var is unbiased by default, so the division below is by n-1, not n.
+// That choice also affects the backward pass, where it appears as the n/(n-1)
 // factor, so the two have to agree.
 class BatchNorm1d : public Layer {
 public:
@@ -489,8 +495,9 @@ public:
         out_.resize(x.rows, dim_);
         if (!training_) {
             // The running estimates exist for exactly this call. A single
-            // example has no batch to be normalised against, which is the
-            // awkwardness batch normalisation introduces and then papers over.
+            // example has no batch to be normalised against. Batch
+            // normalisation creates this problem, and the running estimates
+            // are its workaround.
             for (int j = 0; j < dim_; ++j) {
                 const double inv = 1.0 / std::sqrt(running_var_[j] + eps_);
                 for (int i = 0; i < x.rows; ++i) {
@@ -539,10 +546,11 @@ public:
     }
 
 protected:
-    // The one derivative in this repo that is not obvious by inspection. Every
-    // example's normalised value depends on the mean and the variance, and both
-    // depend on all n examples, so one output's gradient reaches back through
-    // the whole batch. Written out, with S1 and S2 the two column sums:
+    // The one derivative in this repo that is not obvious from reading the
+    // forward pass. Every example's normalised value depends on the mean and
+    // the variance, and both depend on all n examples. So the gradient of one
+    // output reaches back to the whole batch. Written out, with S1 and S2 the
+    // two column sums:
     //
     //   dx = invstd/n * (n*dxhat - S1 - n/(n-1) * xhat * S2)
     //
@@ -551,8 +559,8 @@ protected:
     //   dhprebn = bngain*bnvar_inv/n * (n*dhpreact - dhpreact.sum(0)
     //             - n/(n-1)*bnraw*(dhpreact*bnraw).sum(0))
     //
-    // gradient_check() below compares it against central differences, because
-    // a wrong version of this does not crash - it just trains slightly badly.
+    // gradient_check() below compares it with central differences, because a
+    // wrong version of this does not crash; it only trains a little worse.
     const Matrix& backward_impl(const Matrix& dout) override {
         CHECK(training_, "backward pass through batch normalisation in "
             "evaluation mode: the batch statistics it would differentiate "
@@ -601,8 +609,9 @@ private:
 // The network
 // ---------------------------------------------------------------------------
 
-// Softmax over one row of kVocab logits. Subtracting the row max first costs
-// nothing and keeps exp() away from overflow; softmax is invariant to it.
+// Softmax over one row of kVocab logits. Subtracting the row maximum first
+// costs almost nothing and prevents overflow in exp(). It does not change the
+// result.
 //
 // Python: probs = F.softmax(logits, dim=1)
 void softmax(const double* logits, double* probs) {
@@ -617,9 +626,9 @@ void softmax(const double* logits, double* probs) {
     }
 }
 
-// The embedding table stays outside the layer stack, the way it does in the
-// video: C is a lookup, not a matrix multiply, so it has no Linear to live in
-// until a later video gives it one.
+// The embedding table stays outside the layer stack, as in the video. C is a
+// lookup, not a matrix multiply, so there is no Linear layer for it. A later
+// video gives it a layer of its own.
 //
 // Python:
 //   emb = C[Xtr[ix]]
@@ -653,7 +662,8 @@ public:
         }
     }
 
-    // params_ holds the address of C_, so the object has to stay where it is.
+    // params_ holds the address of C_, so the object must not be copied or
+    // moved.
     Net(const Net&) = delete;
     Net& operator=(const Net&) = delete;
 
@@ -717,9 +727,10 @@ public:
         return cross_entropy(logits, d, rows, n, nullptr);
     }
 
-    // Returns the batch's mean loss and leaves d(loss)/d(parameter) summed into
-    // every gradient. The caller owns zero_grad(), so two half-batches can be
-    // accumulated into one step the way the gradient check below wants.
+    // Returns the batch's mean loss, and adds d(loss)/d(parameter) into every
+    // gradient. The caller is responsible for zero_grad(). So the gradients of
+    // two half-batches can be added up for one step, which the gradient check
+    // below needs.
     double forward_backward(const Dataset& d, const size_t* rows, int n) {
         const Matrix& logits = forward(d, rows, n);
         const double loss = cross_entropy(logits, d, rows, n, &dlogits_);
@@ -733,9 +744,10 @@ public:
     }
 
     // Mean negative log likelihood over a whole split, in nats. Evaluation runs
-    // in chunks rather than as one enormous batch because a 22655-row hidden
-    // layer is 36MB of doubles, and because batch normalisation in evaluation
-    // mode treats the examples independently anyway.
+    // in chunks, not as one very large batch, because a hidden layer with
+    // 22655 rows is 36MB of doubles. Batch normalisation in evaluation mode
+    // treats the examples independently anyway, so the chunks give the same
+    // result.
     //
     // Python:
     //   emb = C[Xdev]
@@ -778,8 +790,9 @@ public:
     //       if ix == 0:
     //           break
     std::string sample(std::mt19937& g) {
-        // A model that never emits '.' would loop forever. The longest name in
-        // the dataset is 15 characters, so this can only mean something broke.
+        // A model that never produces '.' would loop forever. The longest name
+        // in the dataset has 15 characters, so reaching this limit can only
+        // mean that something is broken.
         constexpr size_t kMaxLength = 1000;
 
         set_training(false);
@@ -813,8 +826,8 @@ public:
     }
 
     // The output of the first layer of this kind, for the diagnostics. Null if
-    // the network has none, which is how the sections that print tanh
-    // statistics stay quiet about a network that has no tanh.
+    // the network has no such layer. That is how the sections that print tanh
+    // statistics print nothing for a network without tanh.
     const Matrix* first_output_of(const char* which) const {
         for (const auto& layer : layers_) {
             if (std::string(layer->kind()) == which) {
@@ -837,10 +850,10 @@ private:
         }
     }
 
-    // The embedding gradient scatters back into C, and += is load-bearing: a
-    // character appearing twice in one context contributes twice, and a
-    // character appearing in several examples of the batch contributes once per
-    // example.
+    // The embedding gradient is added back into C, and the += is essential. A
+    // character that appears twice in one context contributes twice, and a
+    // character that appears in several examples of the batch contributes once
+    // per example.
     void scatter_embedding_grad(const Dataset& d, const size_t* rows, int n,
         const Matrix& demb) {
         for (int i = 0; i < n; ++i) {
@@ -855,9 +868,9 @@ private:
         }
     }
 
-    // Softmax and mean negative log likelihood over the batch. The pair
-    // collapses to probs - onehot(target) as it did in the two previous files;
-    // dividing by n here is what makes the loss a mean rather than a sum.
+    // Softmax and mean negative log likelihood over the batch. As in the two
+    // previous files, the gradient is probs - onehot(target). The division by
+    // n here makes the loss a mean, not a sum.
     //
     // Python: loss = F.cross_entropy(logits, Y)
     double cross_entropy(const Matrix& logits, const Dataset& d,
@@ -901,17 +914,18 @@ constexpr int kHidden = 200;
 constexpr int kBatch = 32;
 
 constexpr double kBnEps = 1e-5;
-constexpr double kBnMomentum = 0.1;    // torch's default, and the video's class
+constexpr double kBnMomentum = 0.1;    // the default in torch and in the video
 
-// tanh squashes, so a layer initialised to preserve the spread of its input has
-// to over-correct on the way in. 5/3 is the number torch.nn.init.calculate_gain
-// returns for tanh, and it is the only thing separating a deep stack whose
-// activations hold their shape from one whose activations fade out.
+// tanh compresses its input. So a layer whose initialisation should keep the
+// spread of its input has to scale the input up a little before the tanh. 5/3
+// is the value that torch.nn.init.calculate_gain returns for tanh. Without
+// this gain, the activations of a deep stack fade out; with it, they keep
+// their spread.
 constexpr double kTanhGain = 5.0 / 3.0;
 constexpr double kOutputGain = 0.1;    // the video's "make the last layer less confident"
 
-// The two thresholds the video reads off its plots: 0.97 for "how much of this
-// layer is in the flat part of tanh", 0.99 for the white pixels in
+// The two thresholds that the video uses in its plots: 0.97 for "how much of
+// this layer is in the flat part of tanh", and 0.99 for the white pixels in
 // plt.imshow(h.abs() > 0.99).
 constexpr double kSaturated = 0.97;
 constexpr double kDead = 0.99;
@@ -928,10 +942,10 @@ struct Recipe {
 std::vector<std::unique_ptr<Layer>> build_layers(const Recipe& r, std::mt19937& g) {
     std::vector<std::unique_ptr<Layer>> layers;
 
-    // With batch normalisation the hidden bias is spurious: the mean
-    // subtraction removes any constant added to the preactivations, so b1's
-    // only lasting effect would be the gradient it wastes. The video deletes it
-    // for exactly that reason.
+    // With batch normalisation, the hidden bias is useless: the mean
+    // subtraction removes any constant added to the preactivations. So b1
+    // would only waste computation on its gradient. The video removes it for
+    // exactly that reason.
     layers.push_back(std::make_unique<Linear>(kBlock * kEmbed, kHidden,
         r.w1_scale, r.b1_scale, !r.batchnorm, g));
     if (r.batchnorm) {
@@ -943,8 +957,8 @@ std::vector<std::unique_ptr<Layer>> build_layers(const Recipe& r, std::mt19937& 
     return layers;
 }
 
-// sqrt is not constexpr, so the Kaiming scales are built here rather than
-// declared above with the rest of the constants.
+// sqrt is not constexpr, so the Kaiming scales are computed here, not declared
+// above with the other constants.
 std::vector<Recipe> recipes() {
     const double kaiming_hidden = kTanhGain / std::sqrt(static_cast<double>(kBlock * kEmbed));
     const double kaiming_out = kOutputGain / std::sqrt(static_cast<double>(kHidden));
@@ -993,10 +1007,10 @@ double fraction_above(const Matrix& m, double threshold) {
     return static_cast<double>(hits) / static_cast<double>(m.v.size());
 }
 
-// The video's plt.imshow(h.abs() > 0.99, cmap='gray'): a column that is white
-// all the way down is a neuron that saturated for every example in the batch,
-// so no gradient reaches its weights from this batch at all. Counting those
-// columns is the same observation without the picture.
+// The video's plt.imshow(h.abs() > 0.99, cmap='gray'). A column that is white
+// from top to bottom is a neuron that is saturated for every example in the
+// batch, so no gradient from this batch reaches its weights. Counting those
+// columns gives the same information without the picture.
 int dead_neurons(const Matrix& h, double threshold) {
     int dead = 0;
     for (int j = 0; j < h.cols; ++j) {
@@ -1011,7 +1025,7 @@ int dead_neurons(const Matrix& h, double threshold) {
     return dead;
 }
 
-// The ASCII stand-in for the video's plt.hist(h.view(-1).tolist(), 50).
+// A text version of the video's plt.hist(h.view(-1).tolist(), 50).
 void print_histogram(const double* v, size_t n, double lo, double hi) {
     constexpr int kBuckets = 25;
     constexpr int kBarWidth = 46;
@@ -1035,9 +1049,9 @@ void print_histogram(const double* v, size_t n, double lo, double hi) {
     }
 }
 
-// Everything the first half of the video reads off a single forward pass at
-// step 0: the loss a fresh network scores, how far its logits spread, and what
-// the hidden tanh is doing to the gradient that has to pass back through it.
+// Everything that the first half of the video reads from a single forward pass
+// at step 0: the loss of a new network, how widely its logits spread, and what
+// the hidden tanh does to the gradient that has to pass back through it.
 void report_init(const char* label, Net& net, const Dataset& d,
     const size_t* rows, int n, bool histogram) {
     const double loss = net.forward_loss(d, rows, n);
@@ -1066,10 +1080,10 @@ void report_init(const char* label, Net& net, const Dataset& d,
     }
 }
 
-// The scratch cell the video uses to motivate Kaiming: multiply a unit gaussian
-// by a matrix of unit gaussians and the spread grows by sqrt(fan_in), so a
-// stack of such layers either explodes or (through tanh) collapses. Dividing by
-// sqrt(fan_in) is the whole fix.
+// The small experiment that the video uses to motivate Kaiming init. If you
+// multiply unit gaussians by a matrix of unit gaussians, the spread grows by
+// sqrt(fan_in). So in a stack of such layers, the values either explode or
+// (through tanh) collapse. Dividing by sqrt(fan_in) is the whole fix.
 //
 // Python:
 //   x = torch.randn(1000, 10)
@@ -1142,10 +1156,10 @@ void report_activations(const Net& net) {
     }
 }
 
-// The same loop over the gradient of each layer's output rather than the output
-// itself. The video's point is that these should also hold their shape across
-// depth: a stack whose backward statistics shrink layer by layer is one whose
-// early layers barely train.
+// The same loop over the gradient of each layer's output, instead of the
+// output itself. The video's point is that these statistics should also stay
+// similar across depth. If they shrink from layer to layer in the backward
+// pass, the early layers hardly train.
 //
 // Python:
 //   for i, layer in enumerate(layers[:-1]):
@@ -1275,9 +1289,10 @@ TrainResult train(Net& net, const Dataset& data, const Dataset& dev, int steps,
 //       ud.append([((lr * p.grad).std() / p.data.std()).log10().item()
 //                  for p in parameters])
 //
-// The rule of thumb the video draws as a black line at -3: a step that moves a
-// parameter by about a thousandth of its own spread. Much above that and
-// training is unstable; much below and the parameter is not really moving.
+// The rule of thumb that the video draws as a black line at -3: a step should
+// change a parameter by about a thousandth of its own spread. Much more than
+// that makes training unstable; much less means that the parameter hardly
+// changes.
 void report_update_to_data(Net& net, const Dataset& data, int steps,
     double lr, std::mt19937& g) {
     CHECK(steps > 0, "asked for " << steps << " probe steps");
@@ -1301,9 +1316,9 @@ void report_update_to_data(Net& net, const Dataset& data, int steps,
             }
             const Stats d = stats(p.data->data(), p.data->size());
             const Stats gr = stats(p.grad->data(), p.grad->size());
-            // beta and the biases start at exactly zero, so the first few steps
-            // have no spread to compare against and are skipped rather than
-            // reported as an infinity.
+            // beta and the biases start at exactly zero. So in the first few
+            // steps they have no spread to compare with, and those steps are
+            // skipped instead of being reported as infinite.
             if (d.stdev < 1e-12 || gr.stdev <= 0.0) {
                 continue;
             }
@@ -1330,14 +1345,15 @@ void report_update_to_data(Net& net, const Dataset& data, int steps,
 // Checking the one derivative that is not obvious
 // ---------------------------------------------------------------------------
 
-// Batch normalisation's backward pass is the first thing in this repo that
-// cannot be read off the forward pass by inspection, and a wrong version of it
-// does not crash - it trains slightly badly, which looks exactly like a bad
-// hyperparameter. So it gets compared against the definition of a derivative.
+// The backward pass of batch normalisation is the first derivative in this
+// repo that is not obvious from reading the forward pass. A wrong version of
+// it does not crash; it only trains a little worse, which looks exactly like a
+// bad hyperparameter. So it is compared with the definition of a derivative.
 //
-// Central differences on a deliberately tiny network: a wrong n/(n-1), a
-// dropped column sum or a missing gamma all show up as a disagreement in the
-// first significant digit, so the tolerance can be tight without being fragile.
+// Central differences on a network that is very small on purpose: a wrong
+// n/(n-1), a missing column sum or a missing gamma all show up as a
+// disagreement in the first significant digit. So the tolerance can be tight
+// and still never fail by accident.
 void gradient_check(std::mt19937& g) {
     constexpr int kCheckBatch = 8;
     constexpr int kProbesPerParam = 4;
@@ -1367,9 +1383,9 @@ void gradient_check(std::mt19937& g) {
     layers.push_back(std::make_unique<Linear>(kTinyHidden, kVocab, 0.5, 0.0, true, g));
     Net net(kTinyEmbed, std::move(layers), g);
 
-    // gamma starts at 1 and beta and the biases at 0. Those are the values most
-    // likely to make a wrong expression agree with a right one by accident, so
-    // nothing is left sitting on them.
+    // gamma starts at 1, and beta and the biases at 0. With those values, a
+    // wrong expression is most likely to agree with the correct one by
+    // accident. So every parameter is moved away from its starting value.
     std::normal_distribution<double> jitter(0.0, 0.3);
     for (Param& p : net.params()) {
         for (double& v : *p.data) {
@@ -1386,7 +1402,7 @@ void gradient_check(std::mt19937& g) {
         analytic.push_back(*p.grad);
     }
 
-    std::mt19937 probe_rng(20150211);   // the year of the batch norm paper
+    std::mt19937 probe_rng(20150211);   // the date of the batch norm paper
     double worst = 0.0;
     std::string worst_where;
     int probes = 0;
@@ -1398,9 +1414,9 @@ void gradient_check(std::mt19937& g) {
             const size_t k = pick(probe_rng);
             const double saved = (*p.data)[k];
 
-            // Training mode on purpose: it is the batch statistics that the
-            // backward pass differentiates. The forward passes also nudge the
-            // running estimates, which nothing here reads.
+            // Training mode, on purpose: the backward pass differentiates the
+            // batch statistics. The forward passes also change the running
+            // estimates slightly, but nothing here reads them.
             (*p.data)[k] = saved + kH;
             const double up = net.forward_loss(d, rows.data(), kCheckBatch);
             (*p.data)[k] = saved - kH;
@@ -1424,10 +1440,10 @@ void gradient_check(std::mt19937& g) {
     printf("  worst disagreement %.2e (%s)\n", worst, worst_where.c_str());
 
     sanity::Expect chk;
-    // Central differences at h = 1e-6 in double precision are good to about
-    // 1e-9 here, and a genuinely wrong expression - a dropped column sum, an
-    // n where an n-1 belongs - disagrees in the first digit or two. The
-    // threshold sits between the two with room on both sides.
+    // Central differences at h = 1e-6 in double precision are accurate to
+    // about 1e-9 here. A really wrong expression, such as a missing column sum
+    // or an n where n-1 belongs, disagrees in the first digit or two. The
+    // threshold is between the two, with a wide margin on both sides.
     chk.that("hand-written gradients match central differences", worst < 1e-6);
     chk.report();
 }
@@ -1455,8 +1471,8 @@ constexpr int kProbeSteps = 2000;
 //           if isinstance(layer, Linear):
 //               layer.weight *= 5/3
 //
-// One hidden layer is not enough to show anything: the point of the statistics
-// is how they change with depth, and that needs some depth to change across.
+// One hidden layer is not enough to show anything. The point of the statistics
+// is how they change with depth, and that needs several layers.
 std::vector<std::unique_ptr<Layer>> build_deep(double gain, bool batchnorm,
     std::mt19937& g) {
     std::vector<std::unique_ptr<Layer>> layers;
@@ -1476,8 +1492,8 @@ std::vector<std::unique_ptr<Layer>> build_deep(double gain, bool batchnorm,
     return layers;
 }
 
-// The video's numbers, named here so the Expect blocks below read as claims
-// rather than magic constants.
+// The video's numbers, named here so that the Expect blocks below read as
+// claims instead of unexplained constants.
 constexpr double kBigramLoss = 2.4541;     // what makemore_bigram.cpp scores
 constexpr double kMlpDevLoss = 2.17;       // what makemore_mlp.cpp scores
 constexpr double kVideoDevLoss = 2.10;     // the number this video finishes on
@@ -1497,9 +1513,9 @@ void test_makemore_batchnorm() {
         return;
     }
 
-    // The same 80/10/10 split as last video. mt19937 and std::shuffle do not
-    // reproduce Python's random stream, so which names land in which split
-    // differs from the video and the losses drift in the last digit or two.
+    // The same 80/10/10 split as in the last video. mt19937 and std::shuffle
+    // do not reproduce Python's random numbers, so the splits contain other
+    // names than in the video, and the losses differ in the last digit or two.
     std::mt19937 split_rng(42);
     const Splits splits = split_words(words, split_rng);
     const Dataset train_set = build_dataset(splits.train);
@@ -1518,8 +1534,8 @@ void test_makemore_batchnorm() {
         train_set.size() + dev_set.size() + test_set.size()), 228146);
     data.report();
 
-    // One fixed batch, reused by every network in sections 1 to 5, so the five
-    // sets of numbers differ because of the initialisation and nothing else.
+    // One fixed batch, used by every network in sections 1 to 5, so that the
+    // five sets of numbers differ only because of the initialisation.
     std::mt19937 batch_rng(2147483647);
     std::uniform_int_distribution<size_t> pick(0, train_set.size() - 1);
     std::vector<size_t> probe(kBatch);
@@ -1546,8 +1562,8 @@ void test_makemore_batchnorm() {
         "  moves, and a unit that lands there for every example in a batch gets\n"
         "  nothing at all from that batch.\n";
 
-    // The loss a network scores when it is confidently wrong has no upper
-    // bound, so this is a claim about the direction, not the number.
+    // The loss of a network that is confidently wrong has no upper limit. So
+    // this check is about the direction, not about a specific number.
     sanity::Expect init;
     init.that("randn init starts far above a uniform guess",
         naive.forward_loss(train_set, probe.data(), kBatch)
@@ -1591,10 +1607,10 @@ void test_makemore_batchnorm() {
     fixed.close("kaiming init starts near a uniform guess",
         kaiming.forward_loss(train_set, probe.data(), kBatch),
         std::log(static_cast<double>(kVocab)), 0.5);
-    // Not an absolute threshold: this hidden layer is fed the raw embedding
-    // rather than another layer's squashed output, so even a correctly scaled
-    // tanh leaves about a fifth of it past 0.97. What the gain buys is the
-    // comparison against the line above.
+    // This is not an absolute threshold. This hidden layer gets the raw
+    // embedding as input, not the compressed output of another layer. So even
+    // with a correctly scaled tanh, about a fifth of it is above 0.97. What
+    // the gain improves is the comparison with the line above.
     fixed.that("kaiming more than halves the saturated fraction",
         fraction_above(*kaiming.first_output_of("Tanh"), kSaturated)
         < 0.5 * fraction_above(*naive.first_output_of("Tanh"), kSaturated));
@@ -1628,13 +1644,14 @@ void test_makemore_batchnorm() {
     std::vector<TrainResult> results;
     std::unique_ptr<Net> batchnorm_net;
     for (size_t i = 0; i < all.size(); ++i) {
-        // Same seed per recipe, so the five differ by their initialisation and
-        // nothing else - the minibatch order is identical across all of them.
+        // The same seed for every recipe, so the five networks differ only in
+        // their initialisation. The order of the minibatches is identical for
+        // all of them.
         std::mt19937 g(2147483647);
         auto net = std::make_unique<Net>(kEmbed, build_layers(all[i], g), g);
         printf("  [%zu/%zu] %s\n", i + 1, all.size(), all[i].name);
-        // Only the first run prints its trace: the hockey stick in the opening
-        // steps is the thing sections 2 to 5 are about removing.
+        // Only the first run prints its progress. Its loss falls very steeply
+        // in the first steps, and sections 2 to 5 are about removing that.
         results.push_back(train(*net, train_set, dev_set, kSteps, i == 0, g));
         printf("        loss at step 0 %8.4f   train %.4f   dev %.4f   (%.1fs)\n",
             results.back().first_loss, results.back().train_loss,
@@ -1670,8 +1687,9 @@ void test_makemore_batchnorm() {
     trained.that("randn init starts worst and the four fixes do not",
         std::all_of(results.begin() + 1, results.end(),
             [&](const TrainResult& r) { return r.first_loss < results[0].first_loss; }));
-    // kSteps is a quarter of the video's schedule, so the losses sit above its
-    // 2.10 and the tolerance covers the gap. Raise kSteps and this tightens.
+    // kSteps is a quarter of the video's schedule, so the losses are above the
+    // video's 2.10, and the tolerance includes that difference. With a larger
+    // kSteps, the result gets closer to 2.10.
     trained.close("best dev loss", best_dev, kVideoDevLoss, 0.25);
     trained.report();
 

@@ -1,18 +1,19 @@
 // gpt_model.h - the Transformer itself, shared by every file that uses it.
 //
-// gpt.cpp is the walkthrough: it builds the model up the way the video does,
-// trains it, and checks the numbers. gpt_chat.cpp is a tool: it loads a
-// checkpoint the walkthrough saved and lets you type at it. gpt_bench.h holds
-// this model up as the reference that the other implementations - blocked,
-// ATen, CUDA - are checked against. They all need the same model, and none of
-// them is a video port, so the convention that each of these files is read
-// start to finish on its own applies to gpt.cpp and not here.
+// gpt.cpp is the walkthrough: it builds the model step by step as the video
+// does, trains it, and checks the numbers. gpt_chat.cpp is a tool: it loads a
+// checkpoint saved by the walkthrough and lets you type text for the model to
+// continue. gpt_bench.h uses this model as the reference for checking the
+// other implementations (blocked, ATen, CUDA). All of these files need the
+// same model, and none of them is a port of a video. So the rule that each
+// video's file can be read from start to finish on its own applies to
+// gpt.cpp, not to this file.
 //
-// Everything a reader would want to read is still in order below - the data,
-// the layers, attention, the blocks, the optimiser, the checkpoint format -
-// and the commentary came with it. What stayed in gpt.cpp is only what the
-// walkthrough itself needs: the bigram baseline, the two demonstrations, most
-// of the cost model, and the numbers the video reads out.
+// Everything a reader would want to read is still below, in order: the data,
+// the layers, attention, the blocks, the optimiser and the checkpoint format,
+// together with their explanations. gpt.cpp keeps only what the walkthrough
+// itself needs: the bigram baseline, the two demonstrations, most of the cost
+// model, and the numbers that the video reports.
 
 #pragma once
 
@@ -35,56 +36,59 @@
 #include "check.h"
 #include "gpt_gemm.h"
 
-// Neither MSVC nor gcc will vectorise a loop that stores through one pointer
-// and loads through another unless it can prove the two do not overlap, and
-// const says nothing about that. Every use below is on pointers into distinct
-// vectors; the comment at each one says which.
+// MSVC and gcc only vectorise a loop that stores through one pointer and loads
+// through another if they can prove that the two do not overlap. const does
+// not tell them that. Every use of RESTRICT below is on pointers into
+// different vectors, and the comment at each use says which ones.
 #if defined(_MSC_VER) || defined(__GNUC__)
 #define RESTRICT __restrict
 #else
 #define RESTRICT
 #endif
 
-// The loops below are threaded with OpenMP. Nothing here is guarded by an
-// #ifdef, because a compiler without it ignores the pragmas and every loop runs
-// exactly as it did when it was serial - which is also why the shape of each
-// loop had to survive being parallelised rather than being rewritten around the
-// threads.
+// The loops below are threaded with OpenMP. Nothing here is inside an #ifdef.
+// A compiler without OpenMP ignores the pragmas, and every loop then runs
+// exactly as it did before it was threaded. For the same reason, each loop
+// kept its serial structure when it was parallelised, instead of being
+// rewritten around the threads.
 //
-// The project passes /openmp:llvm, whose runtime has the better scheduler and
-// the cheaper barrier. Nothing below needs it though: no collapse, no
-// reductions, no array sections, and every loop variable is a signed int, so
-// this is all inside OpenMP 2.0 and plain /openmp builds it too. That matters
-// because /openmp:llvm links libomp140.x86_64.dll while /openmp links the
-// vcomp140.dll that every machine with the VC redistributable already has.
+// The project passes /openmp:llvm, whose runtime has a better scheduler and
+// cheaper barriers. But nothing below needs it: there is no collapse, no
+// reduction and no array section, and every loop variable is a signed int. So
+// everything here is within OpenMP 2.0, and plain /openmp builds it too. That
+// matters because /openmp:llvm links libomp140.x86_64.dll, while /openmp links
+// vcomp140.dll, which every machine with the VC redistributable already has.
 #ifdef _OPENMP
 #include <omp.h>
 #endif
 
-// A named namespace rather than an anonymous one, because two translation units
-// have to agree on these types. Free functions below are inline for the same
-// reason.
+// A named namespace, not an anonymous one, because different translation units
+// have to agree on these types. The free functions below are inline for the
+// same reason.
 namespace gpt {
 
-// The scalar type, named once. Flipped to float on 2026-09-18, the threading
-// pass having run out of room: an AVX2 register holds 8 lanes of it instead of
-// 4, and half as many bytes cross the cache per weight, so it is the one change
-// that should help both of the two things still left undone here. Measured on
-// the i9 it helped neither: section 6 took 18.3s against double's 17.9s. That
-// says the loops are not being vectorised, or are too short at 32 channels for
-// it to matter - not that float was a mistake.
+// The scalar type, defined in one place. It was changed to float on
+// 2026-09-18, after threading had given all the speed it could. An AVX2
+// register holds 8 floats instead of 4 doubles, and each weight moves half as
+// many bytes through the cache. So float should have helped with both of the
+// remaining limits: vector width and memory traffic. Measured on the i9, it
+// helped with neither: section 6 took 18.3s with float and 17.9s with double.
+// This shows that the loops are not vectorised, or that at 32 channels they
+// are too short for vectorisation to matter. It does not show that float was
+// a mistake.
 //
-// What it costs is gradient_check(), which leans on central differences being
-// good to about 1e-9 - a property of double and not of float. Its kH and
-// kTolerance widen accordingly, and it stops being evidence that the gradients
-// are exact and becomes evidence that they are not wrong. Flipping back is this
-// one line: checkpoints carry sizeof(real) in their filename, so a double build
-// and a float build keep separate files and neither will read the other's.
+// The cost is in gradient_check(). That check depends on central differences
+// being accurate to about 1e-9, which is true for double but not for float.
+// So its kH and kTolerance are larger in a float build. With float, the check
+// can no longer show that the gradients are exact; it can only catch clear
+// errors, such as a wrong sign or a missing term. To switch back, change this
+// one line. Checkpoints have sizeof(real) in their file name, so double and
+// float builds keep separate files, and neither reads the other's files.
 using real = float;
 
-// Inside a parallel region these describe the team. Outside one - and in a
-// build with no OpenMP at all - they describe the single thread that is
-// running, which is what makes the serial path fall out of the same code.
+// Inside a parallel region, these describe the team. Outside a parallel
+// region, and in a build without OpenMP, they describe the single running
+// thread. So the serial case needs no separate code.
 inline int thread_count() {
 #ifdef _OPENMP
     return omp_get_num_threads();
@@ -101,8 +105,8 @@ inline int thread_index() {
 #endif
 }
 
-// What a large enough loop would actually get, which is what the cost model in
-// gpt.cpp wants to print alongside its throughput number.
+// The number of threads that a large enough loop would get. The cost model in
+// gpt.cpp prints it next to its throughput number.
 inline int available_threads() {
 #ifdef _OPENMP
     return omp_get_max_threads();
@@ -111,16 +115,16 @@ inline int available_threads() {
 #endif
 }
 
-// Which code the multiplies below run. kScalar is the loops as written, which
-// produced every number the walkthrough prints. kBlocked hands the Linear
-// layers and the four products inside attention to the cache-blocked,
-// vectorised multiply in gpt_gemm.h. The two agree to float rounding rather
-// than bit for bit, so the walkthrough stays on kScalar - its reproduction
-// checks are to four decimals - and gpt_blocked.cpp is where kBlocked runs.
+// Which code the multiplies below run. kScalar is the loops as written here;
+// they produced every number that the walkthrough prints. kBlocked sends the
+// Linear layers and the four products inside attention to the cache-blocked,
+// vectorised multiply in gpt_gemm.h. The two agree to float rounding, not bit
+// for bit. So the walkthrough stays on kScalar, because its reproduction
+// checks are to four decimals. gpt_blocked.cpp is where kBlocked runs.
 //
-// A process-wide switch rather than a constructor argument, because it is a
-// property of the arithmetic and not of the model: gpt_bench.h flips it around
-// individual calls to run one set of weights both ways.
+// This is a process-wide switch, not a constructor argument, because it is a
+// property of the arithmetic, not of the model. gpt_bench.h changes it around
+// single calls, to run one set of weights both ways.
 enum class Kernels { kScalar, kBlocked };
 
 inline Kernels& active_kernels() {
@@ -132,23 +136,24 @@ inline bool blocked_kernels() {
     return active_kernels() == Kernels::kBlocked;
 }
 
-// Handing a loop to a team of threads costs a few microseconds, so a loop needs
-// more than a few microseconds of work in it to come out ahead. Three shapes
-// occur below and they need different thresholds:
+// Starting a team of threads for a loop costs a few microseconds. So a loop
+// only gets faster with threads if it has clearly more work than that. Three
+// kinds of loop appear below, and they need different thresholds:
 //
-//   - a loop over the B*T rows of a tensor, where one iteration is a whole
-//     matrix row of arithmetic. A few dozen rows are already worth splitting.
+//   - a loop over the B*T rows of a tensor, where one iteration is the
+//     arithmetic for a whole matrix row. A few dozen rows are already worth
+//     dividing between threads.
 //   - a flat elementwise loop, where one iteration is a single multiply. These
-//     are memory-bound and need thousands of iterations before the fork pays
-//     for itself.
-//   - attention, counted in (batch, head, query, key) entries because its
-//     parallelism is over the heads while its work is over the square.
+//     loops are limited by memory speed, and need thousands of iterations
+//     before threads are worth their cost.
+//   - attention, counted in (batch, head, query, key) entries. Its threads are
+//     divided over the heads, but its work grows with the T x T square.
 //
-// The numbers are deliberately cautious, and at the video's small size several
-// loops fall under them and stay serial. That is the right answer rather than a
-// missed opportunity: 8192 elements split sixteen ways is 512 doubles a thread,
-// less work than the fork that handed them out. They are also the first thing
-// to tune if a profile disagrees.
+// The numbers are cautious on purpose, and at the video's small size several
+// loops are below them and stay serial. That is correct, not a missed chance:
+// 8192 elements divided between sixteen threads is 512 floats per thread,
+// which is less work than starting the threads. These numbers are also the
+// first thing to tune if a profile shows otherwise.
 constexpr int kMinParallelRows = 32;
 constexpr int kMinParallelElems = 16384;
 constexpr long long kMinParallelWork = 16384;
@@ -167,15 +172,16 @@ constexpr long long kMinParallelWork = 16384;
 //   encode = lambda s: [stoi[c] for c in s]
 //   decode = lambda l: ''.join([itos[i] for i in l])
 //
-// Unlike the makemore files there is no fixed alphabet to do arithmetic on, so
-// the two maps get built for real. 256 entries is a table rather than a hash
-// map because the corpus is ASCII.
-// Any plain text file works: the vocabulary is whichever distinct bytes turn up
-// in it. Point this at War and Peace and the model trains on War and Peace. The
-// two things to know are that every sanity::Expect below is pinned to tiny
-// Shakespeare and will report a mismatch for anything else (which is what
-// Expect is for), and that the tokens are bytes rather than characters - so a
-// UTF-8 corpus in a non-Latin script gives the model half a letter at a time.
+// Unlike in the makemore files, there is no fixed alphabet that allows simple
+// arithmetic, so the two maps are really built here. A table of 256 entries is
+// used instead of a hash map, because the corpus is ASCII.
+// Any plain text file works: the vocabulary is the set of distinct bytes in
+// it. If you replace input.txt with War and Peace, the model trains on War and
+// Peace. There are two things to know. First, every sanity::Expect below is
+// tied to tiny Shakespeare and will report a mismatch for any other text,
+// which is the purpose of Expect. Second, the tokens are bytes, not
+// characters. So with a UTF-8 corpus in a non-Latin script, the model sees
+// half a letter at a time.
 constexpr const char* kCorpus = "input.txt";
 
 struct Data {
@@ -185,9 +191,10 @@ struct Data {
     int stoi[256];
     int vocab = 0;
 
-    // The directory input.txt came from. Checkpoints go there too, so that a
-    // run from Visual Studio and a run of the bare exe - which have different
-    // working directories - find each other's work.
+    // The directory that input.txt was loaded from. Checkpoints are saved
+    // there too. A run from Visual Studio and a run of the exe on its own have
+    // different working directories, and this way each finds the other's
+    // checkpoints.
     std::string dir;
 
     char decode(int i) const {
@@ -205,8 +212,8 @@ struct Data {
     }
 };
 
-// The vocabulary can hold any byte, so anything outside printable ASCII is
-// shown as an escape rather than sent to the console as-is.
+// The vocabulary can contain any byte, so a byte outside printable ASCII is
+// shown as an escape sequence instead of being sent to the console unchanged.
 inline std::string printable(char c) {
     if (c == '\n') {
         return "\\n";
@@ -224,11 +231,12 @@ inline std::string printable(char c) {
 }
 
 inline bool load_corpus(Data& d) {
-    // Relative to a few plausible working directories: Visual Studio runs with
-    // cwd = $(ProjectDir), a bare exe run has cwd = x64\Debug, and running from
-    // the repo root is the other common case. A CMake build runs from somewhere
-    // in its build tree, which none of those reach, so it names this directory
-    // outright and that goes first.
+    // The data is searched for relative to a few likely working directories.
+    // Visual Studio runs with cwd = $(ProjectDir), a run of the exe on its own
+    // has cwd = x64\Debug, and running from the repo root is the other common
+    // case. A CMake build runs from somewhere in its build tree, which none of
+    // these paths reach. So CMake defines this directory explicitly, and it is
+    // tried first.
     static const char* kDirs[] = {
 #ifdef VARIOUSMLP_DATA_DIR
         VARIOUSMLP_DATA_DIR "/",
@@ -258,8 +266,8 @@ inline bool load_corpus(Data& d) {
         return false;
     }
 
-    // A checkout that rewrote the line endings would change the vocabulary and
-    // every loss below it, so the '\r' goes rather than becoming a 66th token.
+    // If a checkout changed the line endings, '\r' would become a 66th token
+    // and change the vocabulary and every loss below. So '\r' is removed.
     text.erase(std::remove(text.begin(), text.end(), '\r'), text.end());
 
     for (int& s : d.stoi) {
@@ -281,9 +289,9 @@ inline bool load_corpus(Data& d) {
     //         train_data = data[:n]
     //         val_data = data[n:]
     //
-    // Split by position rather than at random: the point of the validation set
-    // is text the model has not been trained on, and consecutive characters of
-    // Shakespeare are anything but independent.
+    // The split is by position, not random. The validation set must be text
+    // that the model has not trained on, and neighbouring characters of
+    // Shakespeare depend strongly on each other.
     std::vector<int> ids;
     ids.reserve(text.size());
     for (char c : text) {
@@ -306,8 +314,8 @@ inline bool load_corpus(Data& d) {
 //
 // One batch is B independent windows into the corpus. Each window of T
 // characters is T separate training examples at once, because the causal mask
-// means position t only ever saw positions 0..t - the reason a Transformer gets
-// so much more out of a batch than the MLP did.
+// lets position t see only positions 0..t. This is why a Transformer learns
+// much more from one batch than the MLP did.
 inline void sample_batch(const std::vector<int>& data, int B, int T,
     std::vector<int>& x, std::vector<int>& y, std::mt19937& g) {
     CHECK(static_cast<int>(data.size()) > T,
@@ -329,10 +337,10 @@ inline void sample_batch(const std::vector<int>& data, int B, int T,
 // Activations
 // ---------------------------------------------------------------------------
 
-// Every activation in a Transformer is (B, T, C) - batch, position, channel -
-// so the shape travels with the data rather than being passed alongside it.
-// Attention is the only thing that cares about the split between B and T;
-// everything else treats the tensor as B*T independent rows and never notices.
+// Every activation in a Transformer has the shape (B, T, C): batch, position,
+// channel. So the shape is stored with the data instead of being passed
+// separately. Only attention needs to know where B ends and T begins.
+// Everything else treats the tensor as B*T independent rows.
 struct Matrix {
     int batch = 0;
     int time = 0;
@@ -340,11 +348,11 @@ struct Matrix {
     std::vector<real> v;
 
     void resize(int b, int t, int c) {
-        // The flat loops over v below index it with int, because OpenMP wants a
-        // signed loop variable and every other count in this file is an int
-        // already. That holds for anything this port trains - the video's final
-        // model peaks at 25M entries in a tensor - but it is a real ceiling,
-        // and one worth failing on rather than wrapping around at.
+        // The flat loops over v below index it with int, because OpenMP needs
+        // a signed loop variable and every other count in this file is already
+        // an int. That is enough for every model this port trains: the video's
+        // final model has at most 25M entries in one tensor. But it is a real
+        // limit, and it is better to fail here than to overflow silently.
         CHECK(static_cast<long long>(b) * t * c <= 2147483647LL,
             "a " << b << "x" << t << "x" << c
             << " tensor has more entries than an int can index");
@@ -373,8 +381,8 @@ struct Param {
     std::vector<real>* grad;
 };
 
-// Softmax over n logits. Subtracting the max first costs nothing and keeps
-// exp() away from overflow; softmax is invariant to it.
+// Softmax over n logits. Subtracting the maximum first costs almost nothing
+// and prevents overflow in exp(). It does not change the result.
 inline void softmax_row(const real* logits, real* probs, int n) {
     const real maxl = *std::max_element(logits, logits + n);
     real denom = 0;
@@ -391,10 +399,11 @@ inline void softmax_row(const real* logits, real* probs, int n) {
 // Layers
 // ---------------------------------------------------------------------------
 
-// out() is virtual because the composite layers below - attention, the
-// feedforward, a whole block - finish inside a sublayer and would otherwise
-// have to copy a (B, T, C) tensor per step just to satisfy the accessor. At
-// the video's final size that copy would be 50MB.
+// out() is virtual because the composite layers below (attention, the
+// feedforward, a whole block) end with a sublayer, and that sublayer's output
+// is their output. Without a virtual out(), they would have to copy a
+// (B, T, C) tensor in every step, only to return it from this accessor. At
+// the video's final size, that copy would be 25MB.
 class Layer {
 public:
     virtual ~Layer() = default;
@@ -415,10 +424,11 @@ protected:
 //   torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 //   torch.nn.init.zeros_(module.bias)
 //
-// The video's _init_weights, which arrives late and quietly: 0.02 everywhere
-// rather than the Kaiming 1/sqrt(fan_in) of the previous video. For n_embd=384
-// those are 0.02 against 0.051, so this is the same "start the layer smaller
-// than you think" instinct, now applied as one number for the whole model.
+// The video's _init_weights, which it adds late and without much explanation:
+// a standard deviation of 0.02 everywhere, instead of the Kaiming
+// 1/sqrt(fan_in) from the previous video. For n_embd=384 those are 0.02 and
+// 0.051. So it follows the same idea, "start each layer with smaller weights
+// than seems necessary", but with one number for the whole model.
 class Linear : public Layer {
 public:
     Linear(int fan_in, int fan_out, bool has_bias, real init_std, std::mt19937& g)
@@ -443,14 +453,14 @@ public:
         CHECK(x.cols == fan_in_, "a " << fan_in_ << "-wide layer was handed "
             << x.cols << " channels");
 
-        // A pointer, not a copy: the layer that produced x owns it and does not
-        // touch it again until the next forward pass, by which time this
-        // layer's backward has already run.
+        // A pointer, not a copy. The layer that produced x owns it, and does
+        // not change it until the next forward pass. By then, this layer's
+        // backward pass has already run.
         x_ = &x;
         out_.resize(x.batch, x.time, fan_out_);
         const int n = x.rows();
         if (blocked_kernels()) {
-            // Seeding every row with the bias turns x*W + b into the
+            // Each row starts as a copy of the bias. Then x*W + b is the
             // add-into-C multiply that gpt_gemm.h provides.
             if (has_bias_) {
                 for (int i = 0; i < n; ++i) {
@@ -481,25 +491,25 @@ public:
         return out_;
     }
 
-    // Three passes where the serial version had one, because the three
-    // gradients this layer produces each want a different loop to be the
+    // Three passes, where the serial version had one. Each of the three
+    // gradients that this layer produces needs a different loop to be the
     // parallel one.
     //
-    // dx is per row and shares nothing. dW and db are sums over every row, so
-    // handing rows to threads would have all of them accumulating into the same
-    // weight. Giving each thread a private copy of dW to reduce afterwards
-    // would cost fan_in*fan_out doubles per thread - 4.7MB apiece at the
-    // video's final size - and would change the order the sum is taken in.
-    // Splitting dW by input channel costs neither: thread t owns whole rows of
-    // dW, so no two threads write the same cache line except at the one
-    // boundary between their ranges, and each row is still summed over the
-    // examples in ascending order by a single thread. All three passes produce
-    // bit for bit what the fused serial loop produced.
+    // dx is computed per row and shares nothing. dW and db are sums over all
+    // rows, so if the rows were divided between threads, all threads would
+    // add into the same weights. A private copy of dW per thread, added
+    // together afterwards, would cost fan_in*fan_out floats per thread (2.4MB
+    // each at the video's final size), and it would change the order of the
+    // sum. Dividing dW by input channel avoids both costs. Thread t owns whole
+    // rows of dW, so two threads write to the same cache line only at the one
+    // boundary between their ranges. Each row is still summed over the
+    // examples in ascending order, by a single thread. All three passes
+    // produce exactly the same bits as the fused serial loop.
     //
-    // What the split does cost is that dout is streamed three times instead of
-    // once. At the video's small size it sits in L2 throughout and this is
-    // free; at the scaled-up size it is real, and it is the same cache problem
-    // that blocking has to solve for the multiply itself.
+    // The cost of this division is that dout is read three times instead of
+    // once. At the video's small size, dout stays in L2 the whole time, so
+    // this costs nothing. At the scaled-up size the cost is real. It is the
+    // same cache problem that blocking solves for the multiply itself.
     const Matrix& backward(const Matrix& dout) override {
         const Matrix& x = *x_;
         dx_.resize(x.batch, x.time, fan_in_);
@@ -507,9 +517,9 @@ public:
 
         if (blocked_kernels()) {
             // dx = dout * W^T and dW += x^T * dout: the same multiply with a
-            // different operand transposed. How to split them across threads
-            // is the multiply's business now, and it keeps every output on one
-            // thread, so neither sum depends on the size of the team.
+            // different operand transposed. The multiply now decides how to
+            // divide the work between threads. It computes every output on
+            // one thread, so neither sum depends on the number of threads.
             blocked::gemm(false, true, n, fan_in_, fan_out_, real(1),
                 dout.v.data(), fan_out_, w_.data(), fan_out_,
                 dx_.v.data(), fan_in_, true);
@@ -560,11 +570,11 @@ public:
     }
 
 private:
-    // db is a column sum, and it stays serial. It is one pass over dout
-    // against the fan_in passes of the multiply - a fraction of a percent of
-    // the work here - and splitting fan_out doubles across sixteen threads
-    // would put several of them on one cache line, which costs more than it
-    // saves. Both kinds of kernel share it.
+    // db is a column sum, and it stays serial. It is one pass over dout,
+    // compared with the fan_in passes of the multiply, so it is a fraction of
+    // a percent of the work here. Dividing fan_out values between sixteen
+    // threads would put several threads on one cache line, which costs more
+    // than it saves. Both kinds of kernel use this function.
     void accumulate_bias_grad(const Matrix& dout) {
         if (!has_bias_) {
             return;
@@ -589,17 +599,18 @@ private:
 
 // Python: nn.LayerNorm(n_embd)
 //
-// Batch normalisation from the previous video, turned ninety degrees. That one
-// normalised a feature across the examples in a batch, which coupled the
-// examples together and forced a running mean and variance for evaluation.
-// This one normalises a row across its own channels, so every position is
-// independent of every other, there is nothing to remember between batches, and
-// train and evaluation are the same code. For a model whose whole point is
-// variable-length sequences that difference is decisive.
+// This is batch normalisation from the previous video, but along the other
+// axis. Batch normalisation normalised each feature across the examples of a
+// batch. That made the examples depend on each other, and it needed a running
+// mean and variance for evaluation. Layer normalisation normalises each row
+// across its own channels. So every position is independent of every other,
+// nothing has to be remembered between batches, and training and evaluation
+// use the same code. For a model built for sequences of varying length, that
+// difference is very important.
 //
-// torch.var is unbiased by default but nn.LayerNorm divides by C, not C-1,
-// which is why there is no Bessel factor in the backward pass here and there
-// was one in BatchNorm1d.
+// torch.var is unbiased by default, but nn.LayerNorm divides by C, not C-1.
+// That is why the backward pass here has no Bessel factor, while the one in
+// BatchNorm1d had one.
 class LayerNorm : public Layer {
 public:
     explicit LayerNorm(int dim, real eps = real(1e-5))
@@ -622,9 +633,9 @@ public:
         invstd_.assign(static_cast<size_t>(n), real(0));
 
         const real inv_c = real(1) / dim_;
-        // A row normalises against its own channels and nothing else, which is
-        // the property that made LayerNorm the right choice here in the first
-        // place and now makes it trivially parallel.
+        // Each row is normalised using only its own channels. That property
+        // is why LayerNorm was chosen for this model, and it also makes this
+        // loop easy to parallelise.
 #pragma omp parallel for schedule(static) if(n >= kMinParallelRows)
         for (int i = 0; i < n; ++i) {
             const real* xi = x.row(i);
@@ -658,17 +669,18 @@ public:
     //
     //   dx = invstd * (dxhat - mean(dxhat) - xhat * mean(dxhat * xhat))
     //
-    // The two subtracted terms are the mean and the variance pulling back: a
-    // row cannot be shifted or scaled by the gradient without the
-    // normalisation undoing it, so only the shape of the change survives.
+    // The two subtracted terms come from the mean and the variance. If the
+    // gradient shifted or scaled a whole row, the normalisation would undo
+    // that change. So only the part of the change that is not a shift or a
+    // scaling remains.
     const Matrix& backward(const Matrix& dout) override {
         const int n = dout.rows();
         dx_.resize(dout.batch, dout.time, dim_);
 
         const real inv_c = real(1) / dim_;
-        // dx first, one row per thread. The two parameter gradients come out of
-        // the same loop in the serial version, but they are sums over every
-        // row, so they have to leave it.
+        // dx first, one row per thread. In the serial version, the same loop
+        // also computed the two parameter gradients. But they are sums over
+        // all rows, so they have to be computed in a separate loop.
 #pragma omp parallel for schedule(static) if(n >= kMinParallelRows)
         for (int i = 0; i < n; ++i) {
             const real* RESTRICT di = dout.row(i);
@@ -691,13 +703,13 @@ public:
             }
         }
 
-        // And the parameter gradients serially. Unlike the Linear layer above
-        // there is no second axis to split these along - there are dim_ of them
-        // and threads would land several to a cache line - and the arithmetic
-        // is a few tenths of a percent of what the Linear layers either side of
-        // this one are doing. Keeping it serial also keeps the summation order
-        // the one the serial build used, which is what makes the loss curve
-        // comparable across the two.
+        // Then the parameter gradients, serially. Unlike in the Linear layer
+        // above, there is no second axis to divide them along. There are only
+        // dim_ of them, and several threads would share one cache line. The
+        // arithmetic is also only a few tenths of a percent of the work of the
+        // Linear layers before and after this one. A serial loop also keeps
+        // the summation order of the serial build, so the loss curves of the
+        // two builds can be compared.
         for (int i = 0; i < n; ++i) {
             const real* di = dout.row(i);
             const real* xh = xhat_.row(i);
@@ -750,10 +762,10 @@ public:
 
 // Python: nn.Dropout(p)
 //
-// Inverted dropout: the surviving activations are divided by 1-p during
-// training so that evaluation, where nothing is dropped, needs no correction.
-// The video reaches for it only at the scale-up, where the model finally has
-// enough parameters to memorise its way through the training set.
+// Inverted dropout: during training, the kept activations are divided by 1-p.
+// So evaluation, where nothing is dropped, needs no correction. The video adds
+// dropout only at the scale-up, where the model has enough parameters to
+// memorise the training set.
 class Dropout : public Layer {
 public:
     Dropout(real p, std::mt19937& g) : p_(p), rng_(g()) {
@@ -773,11 +785,11 @@ public:
         const real scale = real(1) / keep;
         out_.resize(x.batch, x.time, x.cols);
         mask_.assign(x.v.size(), real(0));
-        // Serial, and not for want of trying: the mask is drawn from one
-        // generator, so threads would both race on its state and draw a
-        // different mask on every run. A reproducible parallel dropout needs a
-        // counter-based generator keyed by element index, which is a different
-        // piece of work from this one.
+        // This loop is serial on purpose. The mask comes from one random
+        // generator. With threads, they would race on its state, and every
+        // run would draw a different mask. A reproducible parallel dropout
+        // needs a counter-based generator keyed by the element index, which
+        // would be a separate piece of work.
         std::uniform_real_distribution<real> u(real(0), real(1));
         for (size_t k = 0; k < x.v.size(); ++k) {
             if (u(rng_) < keep) {
@@ -801,8 +813,9 @@ public:
         return dx_;
     }
 
-    // Disabled dropout returns its input untouched rather than copying it, so
-    // the base class's out_ would be empty. This keeps out() honest.
+    // When dropout is off, forward() returns its input unchanged instead of
+    // copying it, so the base class's out_ would be empty. This override makes
+    // out() return the correct tensor in that case.
     const Matrix& out() const override {
         return passthrough_ ? *passthrough_ : out_;
     }
@@ -837,23 +850,24 @@ private:
 //           out = torch.cat([h(x) for h in self.heads], dim=-1)
 //           return self.dropout(self.proj(out))
 //
-// The video writes one Head and then a list of them; this runs all n_head at
-// once out of a single key/query/value projection each, which is the same
-// arithmetic with the concatenation done up front instead of at the end. Head h
-// owns channels [h*hs, (h+1)*hs) of every one of them.
+// The video writes one Head class and then a list of heads. This class runs
+// all n_head heads at once, from a single key, query and value projection.
+// That is the same arithmetic, with the concatenation done at the start
+// instead of at the end. Head h owns channels [h*hs, (h+1)*hs) of each
+// projection.
 //
-// Three things are worth naming because they are easy to lose in the tensor
-// expression above:
+// Three things are easy to miss in the tensor expression above, so they are
+// stated here:
 //
-//   - the mask is not an optimisation, it is the training signal. Position t
-//     may only attend to 0..t, which is what makes all T positions of a window
-//     T separate examples rather than one.
-//   - the 1/sqrt(head_size) is there so the scores arrive at softmax with unit
-//     variance. Without it a wide head produces large dot products, softmax
-//     saturates toward one-hot, and the gradient through it vanishes - the
-//     same failure the previous video diagnosed in tanh.
-//   - the masked entries are stored as zero probability rather than -inf, so
-//     the backward pass can loop over u <= t and ignore the rest.
+//   - the mask is not an optimisation; it defines the training task. Position
+//     t may only attend to 0..t. Because of that, the T positions of a window
+//     are T separate examples, not one.
+//   - the 1/sqrt(head_size) factor gives the scores unit variance when they
+//     reach the softmax. Without it, a wide head produces large dot products,
+//     the softmax output becomes almost one-hot, and the gradient through it
+//     goes to zero. The previous video found the same problem with tanh.
+//   - the masked entries are stored as zero probability, not as -inf, so the
+//     backward pass can loop over u <= t and ignore the rest.
 class CausalSelfAttention : public Layer {
 public:
     CausalSelfAttention(int n_embd, int n_head, real dropout, real init_std,
@@ -889,27 +903,28 @@ public:
         const Matrix& k = key_.forward(x);
         const Matrix& v = value_.forward(x);
 
-        // One row of att_ per (batch, head, query position), holding that
-        // position's distribution over the keys it is allowed to see.
+        // One row of att_ per (batch, head, query position). It holds that
+        // position's probability distribution over the keys it may see.
         //
-        // The batch and head loops are flattened into one so that OpenMP has a
-        // single index to hand out. (batch, head) is the axis to split on - not
-        // the query position - because the backward pass accumulates down the
-        // key axis and so cannot be split by t, and the two passes have to
-        // agree. Every (batch, head) does identical work, so a static schedule
-        // balances the team exactly.
+        // The batch and head loops are merged into one loop, so that OpenMP
+        // has a single index to divide. The work is divided by (batch, head),
+        // not by query position. The backward pass sums along the key axis, so
+        // it cannot be divided by t, and the two passes have to use the same
+        // division. Every (batch, head) does the same amount of work, so a
+        // static schedule balances the threads exactly.
         const int bh_count = B * n_head_;
         const long long attn_work = static_cast<long long>(bh_count) * T * T;
 
         att_.resize(bh_count, T, T);
         if (blocked_kernels()) {
-            // The scores for one (batch, head) are Q K^T scaled, a T x T
-            // product whose operands are that head's hs-wide slice of every
-            // row - hence the n_embd strides. The whole square is multiplied
-            // and the masked half then overwritten, which wastes half of a
-            // product that is a few percent of the model's arithmetic in
-            // exchange for handing the multiply a plain rectangle. Each call
-            // stays on its thread; the threads are already split by head.
+            // The scores for one (batch, head) are Q K^T, scaled. This is a
+            // T x T product whose operands are that head's hs-wide slice of
+            // every row, which is why the strides are n_embd. The whole
+            // square is multiplied, and the masked half is then overwritten.
+            // That wastes half of a product that is only a few percent of the
+            // model's arithmetic, and in return the multiply gets a plain
+            // rectangle. Each call stays on its own thread, because the
+            // threads are already divided by head.
 #pragma omp parallel for schedule(static) if(attn_work >= kMinParallelWork)
             for (int bh = 0; bh < bh_count; ++bh) {
                 const int b = bh / n_head_;
@@ -945,7 +960,7 @@ public:
                     }
                     softmax_row(a, a, t + 1);
                     for (int u = t + 1; u < T; ++u) {
-                        a[u] = real(0);        // the masked future
+                        a[u] = real(0);        // masked future positions
                     }
                 }
             }
@@ -953,12 +968,14 @@ public:
 
         const Matrix& a = attn_drop_.forward(att_);
 
-        // Head h writes channels [h*hs, (h+1)*hs) of heads_ and no others, so
-        // the threads never meet even though they share the tensor.
+        // Head h writes only channels [h*hs, (h+1)*hs) of heads_. So the
+        // threads never write to the same elements, even though they share the
+        // tensor.
         heads_.resize(B, T, n_embd_);
         if (blocked_kernels()) {
-            // The weights are zero above the diagonal, so multiplying the full
-            // square by V adds nothing from the future.
+            // The attention probabilities are zero above the diagonal, so
+            // multiplying the full square by V adds nothing from future
+            // positions.
 #pragma omp parallel for schedule(static) if(attn_work >= kMinParallelWork)
             for (int bh = 0; bh < bh_count; ++bh) {
                 const int b = bh / n_head_;
@@ -1010,19 +1027,21 @@ public:
         dq_.resize(B, T, n_embd_);
         dk_.resize(B, T, n_embd_);
 
-        // out[b,t,h] = sum_{u<=t} a[b,h,t,u] * v[b,u,h], so the weights pick up
-        // a dot product and the values pick up a weighted sum down the column.
+        // out[b,t,h] = sum_{u<=t} a[b,h,t,u] * v[b,u,h]. So the gradient of
+        // each attention probability is a dot product, and the gradient of v
+        // at position u is a sum over all t >= u of a[t,u] * dout[t].
         //
-        // That column sum is why the query position cannot be the parallel
-        // axis: every t from u upwards adds into dv at u. Splitting by
-        // (batch, head) leaves it alone - thread bh owns batch b's channels
-        // [h*hs, (h+1)*hs) of dv outright, and still walks t in order, so the
-        // sums come out in the order the serial version produced them.
+        // That sum is why the work cannot be divided by query position: every
+        // t from u upwards adds into dv at u. Dividing by (batch, head) avoids
+        // the problem. Thread bh alone owns channels [h*hs, (h+1)*hs) of dv
+        // for batch b, and it still goes through t in order. So the sums are
+        // added in the same order as in the serial version.
         if (blocked_kernels()) {
-            // dA = dO V^T and dV = A^T dO, per (batch, head). dA comes out
-            // above the diagonal as well, as dot products nobody asked for;
-            // the softmax backward below only reads u <= t, so they go
-            // nowhere. A^T dO needs no such care, because A is zero there.
+            // dA = dO V^T and dV = A^T dO, per (batch, head). dA is also
+            // computed above the diagonal, where nothing needs it. The softmax
+            // backward below only reads u <= t, so those values are never
+            // used. A^T dO needs no special care, because A is zero above the
+            // diagonal.
 #pragma omp parallel for schedule(static) if(attn_work >= kMinParallelWork)
             for (int bh = 0; bh < bh_count; ++bh) {
                 const int b = bh / n_head_;
@@ -1063,8 +1082,8 @@ public:
         const Matrix& dp = attn_drop_.backward(da_);
 
         // Softmax over a row: ds_u = p_u * (dp_u - sum_w p_w dp_w). The
-        // subtracted term is the constraint that the row sums to one, so
-        // pushing one weight up has to pull the others down.
+        // subtracted term comes from the constraint that each row sums to one:
+        // if one probability goes up, the others must go down.
         ds_.resize(bh_count, T, T);
 #pragma omp parallel for schedule(static) if(attn_work >= kMinParallelWork)
         for (int bh = 0; bh < bh_count; ++bh) {
@@ -1082,12 +1101,12 @@ public:
             }
         }
 
-        // dk accumulates down the key axis the way dv did, so this splits by
-        // (batch, head) for the same reason.
+        // dk is summed along the key axis, like dv, so this loop is also
+        // divided by (batch, head), for the same reason.
         if (blocked_kernels()) {
-            // dQ = scale * dS K and dK = scale * dS^T Q. ds_ was zeroed by its
-            // resize and only written at u <= t, so the future contributes
-            // nothing to either.
+            // dQ = scale * dS K and dK = scale * dS^T Q. The resize set ds_
+            // to zero, and only entries with u <= t were written. So future
+            // positions add nothing to either product.
 #pragma omp parallel for schedule(static) if(attn_work >= kMinParallelWork)
             for (int bh = 0; bh < bh_count; ++bh) {
                 const int b = bh / n_head_;
@@ -1123,7 +1142,8 @@ public:
             }
         }
 
-        // x fed all three projections, so all three gradients come back to it.
+        // x was the input of all three projections, so its gradient is the
+        // sum of all three.
         const Matrix& dxq = query_.backward(dq_);
         const Matrix& dxk = key_.backward(dk_);
         const Matrix& dxv = value_.backward(dv_);
@@ -1170,10 +1190,11 @@ private:
 //               nn.Dropout(dropout),
 //           )
 //
-// Attention is where the positions talk to each other; this is where each
-// position thinks about what it heard, on its own. The video adds it after
-// noticing that the network goes straight from attending to predicting with no
-// computation in between. The 4x is from the original paper.
+// In attention, the positions exchange information with each other. In this
+// layer, each position processes the information it received, on its own. The
+// video adds this layer after it notices that the network goes directly from
+// attention to prediction, with no computation in between. The factor of 4
+// comes from the original paper.
 class FeedForward : public Layer {
 public:
     FeedForward(int n_embd, real dropout, real init_std, std::mt19937& g)
@@ -1213,16 +1234,17 @@ private:
 //           x = x + self.ffwd(self.ln2(x))
 //           return x
 //
-// The two additions are the reason a stack of these trains at all. A residual
-// connection gives the gradient a path from the loss to every layer that does
-// not pass through any weights, so the signal that reaches block 0 is not the
-// product of five Jacobians. The video demonstrates the failure first - blocks
-// without residuals make the model worse, not better - and then fixes it.
+// The two additions are the reason why a stack of these blocks can be trained
+// at all. A residual connection gives the gradient a path from the loss to
+// every layer that does not pass through any weights. So the signal that
+// reaches block 0 is not a product of five Jacobians. The video first shows
+// the failure (without residual connections, more blocks make the model worse,
+// not better) and then fixes it.
 //
-// The normalisation is applied before each sublayer rather than after. The 2017
-// paper does it the other way round; the video mentions that pre-norm is the
-// arrangement everyone settled on, because it keeps the residual path itself
-// free of any normalisation.
+// The normalisation is applied before each sublayer, not after it. The 2017
+// paper does it the other way round. The video mentions that pre-norm is now
+// the standard arrangement, because it keeps the residual path itself free of
+// any normalisation.
 class Block : public Layer {
 public:
     Block(int n_embd, int n_head, real dropout, real init_std, std::mt19937& g)
@@ -1257,9 +1279,10 @@ public:
         return out_;
     }
 
-    // Each residual add is a fan-out in the forward pass, so it is a sum in the
-    // backward pass: the gradient arriving at `out` reaches `mid` both through
-    // the feedforward branch and directly along the skip.
+    // In the forward pass, each residual add uses its input twice, so in the
+    // backward pass the two gradients are summed. The gradient at `out`
+    // reaches `mid` through the feedforward branch, and also directly through
+    // the skip connection.
     const Matrix& backward(const Matrix& dout) override {
         const int n = dout.batch * dout.time * dout.cols;
 
@@ -1311,8 +1334,8 @@ private:
 
 constexpr real kInitStd = real(0.02);
 
-// Cross entropy over B*T independent predictions. Identical to the makemore
-// files apart from the vocabulary being a runtime number.
+// Cross entropy over B*T independent predictions. It is the same as in the
+// makemore files, except that the vocabulary size is known only at run time.
 //
 // Python:
 //   B, T, C = logits.shape
@@ -1328,12 +1351,12 @@ inline real cross_entropy(const Matrix& logits, const int* targets, Matrix* dlog
 
     const real inv_n = real(1) / n;
 
-    // Every row scores on its own, but two things here are shared: the softmax
-    // needs a scratch row of probabilities, and the loss is a sum over all the
-    // rows. The scratch buffer is declared inside the parallel region so each
-    // thread allocates its own, and the per-row losses go to an array that is
-    // added up afterwards in order - so the number this returns is the same
-    // number whatever size the team was.
+    // Each row is scored on its own, but two things here are shared: the
+    // softmax needs a scratch row of probabilities, and the loss is a sum over
+    // all rows. The scratch buffer is declared inside the parallel region, so
+    // each thread allocates its own. The per-row losses go into an array,
+    // which is added up afterwards in order. So the returned number is the
+    // same for any number of threads.
     std::vector<real> row_loss(static_cast<size_t>(n));
 #pragma omp parallel if(n >= kMinParallelRows)
     {
@@ -1371,14 +1394,16 @@ struct Config {
     real lr;
 };
 
-// Roughly what one training step costs. The forward pass is two multiply-adds
-// per parameter per token and the backward pass is twice that again, which is
-// the standard 6N estimate; the two embedding tables come out because they are
-// lookups rather than matrix multiplies. Attention's own two matmuls are not
-// parameters at all, and at context 256 they stop being a rounding error.
+// The approximate number of floating point operations in one training step.
+// The forward pass costs 2 operations (one multiply and one add) per
+// parameter per token, and the backward pass costs twice that. This is the
+// standard 6N estimate. The two embedding tables are left out, because they
+// are lookups, not matrix multiplies. Attention's two products between
+// activations use no parameters at all, and at context 256 they are too large
+// to ignore.
 //
-// Here rather than beside the rest of the cost model in gpt.cpp because
-// gpt_bench.h turns seconds into a rate with it too.
+// This function is here, not with the rest of the cost model in gpt.cpp,
+// because gpt_bench.h also uses it to turn seconds into a rate.
 inline double step_flops(const Config& cfg, size_t params, int vocab) {
     const double lookups = static_cast<double>(vocab + cfg.block) * cfg.n_embd;
     const double matmul = static_cast<double>(params) - lookups;
@@ -1405,12 +1430,12 @@ inline double step_flops(const Config& cfg, size_t params, int vocab) {
 //           x = self.ln_f(x)
 //           logits = self.lm_head(x)
 //
-// The position embedding is what tells attention where things are. Without it
-// the model is a bag of characters: the dot product between a query and a key
-// does not care which of them came first, so "abc" and "cba" would produce the
-// same attention pattern. A learned vector per slot is the cheapest possible
-// fix, and it is why block_size is a hard ceiling on the context - there is no
-// row in the table for position 257.
+// The position embedding tells attention where each character is. Without it,
+// the model sees only an unordered set of characters: the dot product between
+// a query and a key does not depend on which of them came first, so "abc" and
+// "cba" would produce the same attention pattern. A learned vector per
+// position is the simplest solution. It is also why block_size is a hard
+// limit on the context: the table has no row for position 257.
 class Gpt {
 public:
     Gpt(const Config& cfg, int vocab, std::mt19937& g)
@@ -1454,8 +1479,8 @@ public:
         lm_head_.collect(params_);
     }
 
-    // params_ holds the addresses of wte_ and wpe_, so the object has to stay
-    // where it is.
+    // params_ holds the addresses of wte_ and wpe_, so the object must not be
+    // copied or moved.
     Gpt(const Gpt&) = delete;
     Gpt& operator=(const Gpt&) = delete;
 
@@ -1477,9 +1502,10 @@ public:
     }
 
     void zero_grad() {
-        // One tensor per iteration, dynamically scheduled: these differ in size
-        // by three orders of magnitude, and a static split would hand one
-        // thread the token embedding table and another two bias vectors.
+        // One tensor per iteration, with a dynamic schedule. The tensors
+        // differ in size by a factor of about a thousand. With a static
+        // schedule, one thread might get the token embedding table and
+        // another thread two bias vectors.
         const int n = static_cast<int>(params_.size());
 #pragma omp parallel for schedule(dynamic, 1)
         for (int i = 0; i < n; ++i) {
@@ -1492,8 +1518,8 @@ public:
         CHECK(T > 0 && T <= cfg_.block, "a window of " << T
             << " positions, but the position table has " << cfg_.block << " rows");
 
-        // Flattened over (batch, position), which is the same walk the nested
-        // loops made: row i of the tensor is window i/T at slot i%T.
+        // One loop over (batch, position), in the same order as nested loops
+        // would use: row i of the tensor is window i/T at position i%T.
         const int rows = B * T;
         emb_.resize(B, T, cfg_.n_embd);
 #pragma omp parallel for schedule(static) if(rows >= kMinParallelRows)
@@ -1525,17 +1551,18 @@ public:
             d = &blocks_[i]->backward(*d);
         }
 
-        // The two embedding tables scatter their gradients back by index, and
-        // += is load-bearing: a character that appears eight times in a batch
-        // contributes eight times, and every one of the B windows uses the same
-        // row of the position table for slot t.
+        // The gradients of the two embedding tables are added back by index,
+        // and the += is essential. A character that appears eight times in a
+        // batch contributes eight times, and all B windows use the same row of
+        // the position table for position t.
         //
-        // Which is also why this is the one loop in the model that stays
-        // serial. Those repeats are collisions: two positions holding the same
-        // character, or the same slot in different windows, want the same row
-        // at the same time, and there is no axis to split that does not have
-        // them. It is one pass over (B, T, C) against the matrix multiplies on
-        // either side of it, so it is not where the time is anyway.
+        // This is also why this is the only loop in the model that stays
+        // serial. The repeated rows would cause conflicts between threads: two
+        // positions with the same character, or the same position in
+        // different windows, write to the same row. Every way of dividing the
+        // loop has such conflicts. Also, this is only one pass over (B, T, C),
+        // compared with the matrix multiplies before and after it, so it takes
+        // little time anyway.
         for (int b = 0; b < B; ++b) {
             for (int t = 0; t < T; ++t) {
                 const real* de = d->row(b, t);
@@ -1560,28 +1587,28 @@ public:
     //           idx_next = torch.multinomial(probs, num_samples=1)
     //           idx = torch.cat((idx, idx_next), dim=1)
     //
-    // Cropping to the last block_size is not a nicety: position block_size has
-    // no row in the position table. It also means the whole prefix is
-    // recomputed for every character, which is why real implementations cache
-    // the keys and values instead.
-    // `prompt` seeds the context; an empty one starts from token 0, which is
-    // the lowest byte in the corpus and so, for any text file containing a
-    // newline, a blank line - as neutral a thing to start from as this
-    // vocabulary has.
+    // Cropping to the last block_size characters is necessary: position
+    // block_size has no row in the position table. It also means that the
+    // whole context is recomputed for every new character. That is why real
+    // implementations cache the keys and values instead.
+    // `prompt` is the starting context. An empty prompt starts from token 0.
+    // That is the lowest byte in the corpus, which for most text files is the
+    // newline character: the most neutral start this vocabulary has.
     //
-    // Temperature divides the logits before the softmax. Below 1 it sharpens
-    // the distribution toward the characters the model is most sure of, above
-    // 1 it flattens it toward uniform. The video samples straight from the
-    // model and never mentions the knob; at character level it is most of the
-    // difference between words and letter soup, so the tool in gpt_chat.cpp
-    // wants it even though the walkthrough does not.
+    // Temperature divides the logits before the softmax. Below 1, it makes the
+    // distribution sharper, toward the characters the model is most sure of.
+    // Above 1, it makes the distribution flatter, toward uniform. The video
+    // samples directly from the model and never mentions this setting. At the
+    // character level it makes most of the difference between real words and
+    // random letters. So the tool in gpt_chat.cpp needs it, even though the
+    // walkthrough does not.
     std::vector<int> generate(const std::vector<int>& prompt, int count,
         real temperature, std::mt19937& g) {
         CHECK(temperature > real(0), "temperature " << temperature
             << " has to be positive");
 
-        // Dropout has to be off, or the samples are drawn from a different
-        // model than the one that was trained.
+        // Dropout has to be off. Otherwise the samples would come from a
+        // different model than the one that was trained.
         set_training(false);
 
         std::vector<int> ctx = prompt.empty() ? std::vector<int>(1, 0) : prompt;
@@ -1589,8 +1616,7 @@ public:
         std::vector<real> probs(static_cast<size_t>(vocab_));
         std::vector<real> scaled(static_cast<size_t>(vocab_));
         for (int i = 0; i < count; ++i) {
-            const int T = static_cast<int>(std::min<size_t>(
-                static_cast<size_t>(cfg_.block), ctx.size()));
+            const int T = static_cast<int>(std::min<size_t>(static_cast<size_t>(cfg_.block), ctx.size()));
             const int* window = ctx.data() + (ctx.size() - static_cast<size_t>(T));
 
             const Matrix& logits = forward(window, 1, T);
@@ -1609,8 +1635,8 @@ public:
         return ids;
     }
 
-    // What the walkthrough uses: start from a blank line, sample straight from
-    // the model the way the video does.
+    // What the walkthrough uses: start from a newline, and sample directly
+    // from the model, as the video does.
     std::vector<int> generate(int count, std::mt19937& g) {
         return generate(std::vector<int>(), count, real(1), g);
     }
@@ -1634,15 +1660,16 @@ private:
 // Python: torch.optim.AdamW(model.parameters(), lr=learning_rate)
 //
 // The makemore files used plain gradient descent with a hand-tuned step size.
-// That does not survive a model whose parameters have wildly different gradient
-// scales - an embedding row touched once per batch against a weight matrix
-// touched B*T times. Adam divides each parameter's step by its own recent
-// gradient magnitude, which makes one learning rate work for all of them.
+// That does not work for a model whose parameters have very different
+// gradient scales: an embedding row is used once per batch, while a weight
+// matrix is used B*T times. Adam divides each parameter's step by that
+// parameter's own recent gradient size, so one learning rate works for all of
+// them.
 //
-// The W is decoupled weight decay: torch's AdamW shrinks the parameter toward
-// zero as a separate step rather than by adding a term to the gradient, so the
-// decay is not itself divided by sqrt(v). Default weight_decay is 0.01 and the
-// video does not override it, so 0.01 is what actually ran.
+// The W stands for decoupled weight decay. torch's AdamW shrinks each
+// parameter toward zero in a separate step, instead of adding a term to the
+// gradient. So the decay is not divided by sqrt(v). The default weight_decay
+// is 0.01, and the video does not change it, so 0.01 is the value it used.
 class AdamW {
 public:
     AdamW(std::vector<Param>& params, real lr, real beta1 = real(0.9),
@@ -1660,15 +1687,16 @@ public:
 
     void step() {
         ++t_;
-        // Both moments start at zero, so early steps are biased toward it.
-        // Dividing by 1-beta^t undoes that exactly.
+        // Both moments start at zero, so in early steps they are biased toward
+        // zero. Dividing by 1-beta^t removes that bias exactly.
         const real bc1 = real(1) - std::pow(beta1_, static_cast<real>(t_));
         const real bc2 = real(1) - std::pow(beta2_, static_cast<real>(t_));
 
-        // Every parameter steps independently of every other, so the only
-        // question is which axis to hand out. Splitting the tensors rather than
-        // the elements within them costs one fork per step instead of one per
-        // tensor, and dynamic scheduling covers their very different sizes.
+        // Every parameter is updated independently of every other, so the
+        // only question is how to divide the work. Dividing by tensor, not by
+        // element within each tensor, costs one fork per step instead of one
+        // per tensor. The dynamic schedule handles the very different tensor
+        // sizes.
         const int np = static_cast<int>(params_->size());
 #pragma omp parallel for schedule(dynamic, 1)
         for (int k = 0; k < np; ++k) {
@@ -1701,30 +1729,32 @@ private:
 // Checkpoints
 // ---------------------------------------------------------------------------
 
-// Nine hours of training is not something to repeat because the program was
-// restarted. The format is deliberately self-describing: the header carries the
-// shape of the model and the size of its scalar, and every tensor carries its
-// own name and length, so a checkpoint belonging to a differently shaped model
-// is rejected rather than reinterpreted as noise.
+// Hours of training should not have to be repeated just because the program
+// was restarted. The format describes itself, on purpose. The header holds the
+// shape of the model and the size of its scalar type, and every tensor holds
+// its own name and length. So a checkpoint for a model of a different shape is
+// rejected, instead of being read as meaningless numbers.
 //
-// A missing or stale checkpoint is not an error - it means "train instead" - so
-// these report and return false rather than using CHECK. That is a third
-// severity beyond the two in check.h: not a broken program, not a number that
-// drifted, just a file that is not there or no longer fits.
+// A missing or outdated checkpoint is not an error; it only means that the
+// model has to be trained. So these functions report and return false instead
+// of using CHECK. This is a third kind of problem, besides the two in check.h:
+// not a broken program and not a wrong number, but a file that is missing or
+// no longer matches.
 //
-// The bytes are raw doubles in native order. Both machines this runs on are
-// x86-64, so endianness is ignored; the sizeof(real) in the header and in the
-// filename is what stops a float build from reading a double build's file.
+// The bytes are raw `real` values (float by default) in native byte order.
+// Both machines this runs on are x86-64, so endianness is ignored. The
+// sizeof(real) in the header and in the file name stops a float build from
+// reading a double build's file.
 
 constexpr char kCheckpointMagic[8] = { 'V', 'M', 'L', 'P', 'G', 'P', 'T', '2' };
 
 // FNV-1a over the vocabulary and the corpus length. The header already checks
-// the shape of the model, but shape is not identity: two corpora with the same
-// number of distinct characters would produce checkpoints with the same name
-// and a header that validates, and loading one onto the other gives a model
-// whose token 37 stands for a different letter. Nothing about that failure
-// looks like a failure - the losses are simply bad - so it is worth eight bytes
-// to make it impossible.
+// the shape of the model, but the same shape does not mean the same corpus.
+// Two corpora with the same number of distinct characters would produce
+// checkpoints with the same name and a valid header. Loading one into the
+// other would give a model whose token 37 means a different letter. Nothing
+// in that failure looks like a failure; the losses are just bad. So it is
+// worth eight bytes to make it impossible.
 inline std::uint64_t corpus_fingerprint(const Data& d) {
     std::uint64_t h = 1469598103934665603ull;
     auto mix = [&h](unsigned char b) {
@@ -1828,10 +1858,10 @@ inline bool load_params(std::vector<Param>& params, const Config& cfg, const Dat
         return reject("it holds a different number of tensors");
     }
 
-    // Read into a staging buffer first. A file that turns out to be truncated
-    // halfway through should leave the model as it was rather than half
-    // overwritten with one model's weights and half with another's. The cost is
-    // holding the parameters twice, which for the scaled-up model is 86MB.
+    // Read into a staging buffer first. If the file turns out to be truncated
+    // in the middle, the model should stay as it was. It should not end up
+    // with half of its weights from one model and half from another. The cost
+    // is holding the parameters twice, which for the scaled-up model is 86MB.
     std::vector<std::vector<real>> staged(params.size());
     for (size_t i = 0; i < params.size(); ++i) {
         std::int32_t len = 0;
@@ -1890,10 +1920,10 @@ struct Losses {
 //       model.train()
 //       return out
 //
-// Averaged over kEvalIters random batches rather than computed over the whole
-// split: one minibatch loss is far too noisy to read a trend from, and the
-// whole split is 1.1 million positions. The seed is fixed so that two models
-// are scored on the same windows.
+// The loss is averaged over kEvalIters random batches, not computed over the
+// whole split. The loss of one minibatch is far too noisy to show a trend, and
+// the whole split is 1.1 million positions. The seed is fixed, so that two
+// models are scored on the same windows.
 template <class Model>
 Losses estimate_loss(Model& model, const Data& d, int B, int T) {
     model.set_training(false);
@@ -1973,9 +2003,9 @@ TrainResult train(Model& model, const Data& d, int B, int T, real lr, int iters,
 // The two configurations the video trains
 // ---------------------------------------------------------------------------
 
-// The small one, which is what actually runs here. The video reaches it about
-// two thirds of the way through and reads a validation loss just under 2.0 off
-// it before scaling up.
+// The small configuration, which is the one gpt.cpp trains. The video reaches
+// it about two thirds of the way through, and gets a validation loss just
+// under 2.0 with it before scaling up.
 constexpr int kEmbed = 32;
 constexpr int kHeads = 4;
 constexpr int kLayers = 3;
@@ -1985,14 +2015,15 @@ constexpr real kDropout = real(0);
 constexpr real kLr = real(1e-3);
 
 constexpr int kIters = 5000;         // the video's max_iters
-constexpr int kStageIters = 3000;    // for the intermediate models in 2-4
+constexpr int kStageIters = 3000;    // intermediate models, sections 2-4
 constexpr int kReportEvery = 1000;
 
-// The scale-up at the end of the video: 10.8M parameters, validation loss 1.48,
-// about fifteen minutes on an A100. It is recorded rather than run - at 6
-// PFLOP for the full schedule it needs more than the threaded scalar loops in
-// this file. Kernels::kBlocked is the next step, and gpt_blocked.cpp measures
-// what it is worth at this width.
+// The scale-up at the end of the video: 10.8M parameters, validation loss
+// 1.48, about fifteen minutes on an A100. gpt.cpp only records it: the full
+// schedule is about 6 PFLOP, which is too much for the threaded scalar loops
+// in this file. gpt_blocked.cpp measures what Kernels::kBlocked gains at this
+// width. VariousMlp/GptScaled/gpt_scaled.cpp trains this configuration, with
+// the CUDA model and the blocked multiply sharing each batch.
 constexpr int kBigEmbed = 384;
 constexpr int kBigHeads = 6;
 constexpr int kBigLayers = 6;

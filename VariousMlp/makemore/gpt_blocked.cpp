@@ -1,20 +1,20 @@
 // gpt_blocked.cpp - the walkthrough's model with its multiplies cache-blocked
 // and vectorised.
 //
-// Not a second model. This is the same Gpt class gpt.cpp trains, with
-// gpt::active_kernels() switched to kBlocked around every call, so that the
-// Linear layers and the products inside attention go through gpt_gemm.h
-// instead of the loops written beside them. The weights, the layer norms, the
-// softmaxes and every backward pass are shared, which is the point: whatever
-// differs between the two columns below is the multiply and nothing else.
+// This is not a second model. It is the same Gpt class that gpt.cpp trains,
+// with gpt::active_kernels() set to kBlocked around every call. So the Linear
+// layers and the products inside attention use gpt_gemm.h instead of the
+// loops written next to them. The weights, the layer norms, the softmaxes and
+// every backward pass are shared, and that is the point: any difference
+// between the two columns below comes from the multiply and nothing else.
 //
-// The bench in gpt_bench.h does the rest. Section 1 says whether the blocked
-// multiply is right, section 2 whether it trains the same model, and section 3
-// what it is worth at a width where there is finally something to block. At
-// the walkthrough's 32 channels expect little from it - a 32-wide multiply fits
-// in L1 already, and packing it costs about what it saves.
+// The bench in gpt_bench.h does the rest. Section 1 shows whether the blocked
+// multiply is correct, section 2 whether it trains the same model, and
+// section 3 how much faster it is at a width where blocking makes a
+// difference. At the walkthrough's 32 channels, expect little gain: a 32-wide
+// multiply already fits in L1, and packing costs about as much as it saves.
 //
-// CMake-only, because it has its own main. Build the gpt_blocked target.
+// CMake only, because it has its own main. Build the gpt_blocked target.
 
 #include <cstdio>
 #include <exception>
@@ -28,8 +28,9 @@
 int main() {
     using namespace gpt;
 
-    // The whole program is one long demonstration, so a CHECK that fires is
-    // reported and ends it rather than being left to terminate().
+    // The whole program is one long demonstration. So a failed CHECK is
+    // reported here and ends the program. Without this, it would reach
+    // terminate().
     try {
         printf("gpt_blocked: the reference model with Kernels::kBlocked\n");
         printf("  micro-kernel: %s\n\n", blocked::kernel_name<real>());
@@ -39,8 +40,8 @@ int main() {
             return 1;
         }
 
-        // The candidate's own initial weights are thrown away by load(), so
-        // the generator it draws them from does not matter.
+        // load() replaces the candidate's own initial weights, so the
+        // generator that creates them does not matter.
         const auto make = [](const Config& cfg, int vocab) {
             std::mt19937 unused(0);
             return std::make_unique<bench::CpuModel>(cfg, vocab, Kernels::kBlocked,

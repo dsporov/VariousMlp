@@ -2,27 +2,27 @@
 // ("Building makemore Part 2: MLP", video 3 of Neural Networks: Zero to Hero)
 //
 // The bigram model in makemore_bigram.cpp only ever sees one character of
-// context, and the counting table it is equivalent to already has 27x27
-// entries. Three characters of context would need 27^4 of them, most of which
-// are never observed - so the video follows Bengio et al. 2003 instead: embed
-// each character in a short vector, concatenate the last kBlock of them, and
-// push that through one tanh hidden layer. The bigram net scored 2.4541 nats;
-// this one gets under 2.2 on data it was never trained on.
+// context, and the equivalent table of counts already has 27x27 entries. Three
+// characters of context would need 27^4 entries, and most of them would never
+// be observed. So the video follows Bengio et al. 2003 instead: embed each
+// character in a short vector, concatenate the last kBlock vectors, and pass
+// the result through one tanh hidden layer. The bigram net scored 2.4541
+// nats; this one gets under 2.2 on data it was never trained on.
 //
 // What the video builds, in order:
 //   1. the dataset as (context, next character) pairs
-//   2. an 80/10/10 train/dev/test split, so overfitting becomes measurable
-//   3. the learning-rate sweep that picks the step size
-//   4. a 2-dimensional embedding, small enough to plot, which sorts itself
-//      into vowels and consonants with nobody asking it to
+//   2. an 80/10/10 train/dev/test split, so that overfitting can be measured
+//   3. the learning-rate sweep that chooses the step size
+//   4. a 2-dimensional embedding, small enough to plot, which separates
+//      vowels from consonants by itself
 //   5. the same net scaled up: 10 embedding dimensions, 200 hidden units,
 //      11897 parameters
 //
 // Needs names.txt (32033 names, one per line) next to this file.
 //
-// Section 4 trains kSteps minibatches and is by far the longest-running thing
-// in this repo - minutes, not seconds, and Release only. Lower kSteps while
-// you are iterating; the loss just ends up a little higher.
+// Section 4 trains kSteps minibatches and is the slowest part of the
+// walkthroughs before the GPT: minutes, not seconds, and only in Release.
+// Lower kSteps if you run it often; the loss will be a little higher.
 
 #include <algorithm>
 #include <chrono>
@@ -46,9 +46,9 @@ namespace {
 constexpr int kVocab = 27;    // '.' plus the 26 lowercase letters
 constexpr int kBlock = 3;     // characters of context the model gets to see
 
-// encode, decode and load_names are deliberately a copy of the ones in
-// makemore_bigram.cpp rather than a shared header: each video's file is meant
-// to be read start to finish on its own, the way each video is watched.
+// encode, decode and load_names are copies of the ones in makemore_bigram.cpp,
+// on purpose, not a shared header. Each video's file is meant to be read from
+// start to finish on its own, in the same way as each video is watched.
 //
 // Python:
 //   chars = sorted(list(set(''.join(words))))
@@ -69,11 +69,12 @@ inline char decode(int i) {
 
 // Python: words = open('names.txt', 'r').read().splitlines()
 std::vector<std::string> load_names() {
-    // Relative to a few plausible working directories: Visual Studio runs with
-    // cwd = $(ProjectDir), a bare exe run has cwd = x64\Debug, and running from
-    // the repo root is the other common case. A CMake build runs from somewhere
-    // in its build tree, which none of those reach, so it names the directory
-    // outright and that goes first.
+    // The data is searched for relative to a few likely working directories.
+    // Visual Studio runs with cwd = $(ProjectDir), a run of the exe on its own
+    // has cwd = x64\Debug, and running from the repo root is the other common
+    // case. A CMake build runs from somewhere in its build tree, which none of
+    // these paths reach. So CMake defines the directory explicitly, and it is
+    // tried first.
     static const char* kCandidates[] = {
 #ifdef VARIOUSMLP_DATA_DIR
         VARIOUSMLP_DATA_DIR "/names.txt",
@@ -100,8 +101,8 @@ std::vector<std::string> load_names() {
             if (line.back() == '\r') {
                 line.pop_back();  // CRLF
             }
-            // The model has exactly 27 tokens, so a stray uppercase letter,
-            // digit or accent has nowhere to go.
+            // The model has exactly 27 tokens, so an unexpected uppercase
+            // letter, digit or accented letter has no token.
             const bool clean = std::all_of(line.begin(), line.end(),
                 [](char c) { return c >= 'a' && c <= 'z'; });
             if (clean) {
@@ -122,8 +123,9 @@ std::vector<std::string> load_names() {
     return {};
 }
 
-// One example per (context, next character) pair: xs holds kBlock token ids
-// per example laid end to end, ys the single id that follows them.
+// One example per (context, next character) pair. xs holds kBlock token ids
+// per example, one example after another; ys holds the one id that follows
+// each context.
 struct Dataset {
     std::vector<int> xs;
     std::vector<int> ys;
@@ -132,9 +134,9 @@ struct Dataset {
     const int* context(size_t i) const { return &xs[i * kBlock]; }
 };
 
-// The video's build_dataset: slide a window of kBlock characters across each
-// name, starting from '...' and ending on the '.' that terminates it. A short
-// name is not a special case, it simply keeps more of the padding.
+// The video's build_dataset: move a window of kBlock characters across each
+// name, starting from '...' and ending with the '.' at the end of the name. A
+// short name is not a special case; its windows simply contain more padding.
 //
 // Python:
 //   def build_dataset(words):
@@ -184,9 +186,10 @@ void print_examples(const Dataset& d, size_t n) {
     }
 }
 
-// Every token in here becomes a raw offset into the embedding table, so a bad
-// one is an out-of-bounds read rather than a wrong answer. One pass per split
-// before training starts; the training loop itself stays check-free.
+// Every token here becomes a raw offset into the embedding table, so a bad
+// token would be an out-of-bounds read, not just a wrong answer. This is one
+// pass per split before training starts, so the training loop itself needs no
+// checks.
 void validate_dataset(const Dataset& d, const char* what) {
     CHECK(d.size() > 0, what << ": no examples");
     CHECK(d.xs.size() == d.size() * kBlock,
@@ -209,9 +212,9 @@ void validate_dataset(const Dataset& d, const char* what) {
 // The split
 // ---------------------------------------------------------------------------
 //
-// Splitting by name rather than by example is the point: every example cut
-// from one name shares its letters, so scattering them across the splits would
-// let the model meet the dev set during training.
+// The split is by name, not by example, and that matters: all examples from
+// one name share its letters. If they were spread across the splits, the
+// model would see parts of the dev set during training.
 //
 // Python:
 //   random.seed(42)
@@ -245,9 +248,9 @@ Splits split_words(std::vector<std::string> words, std::mt19937& g) {
 // The network
 // ---------------------------------------------------------------------------
 //
-// Bengio et al. 2003, exactly as the video assembles it. Torch does a whole
-// batch at once, so every shape below leads with N; the C++ runs one example at
-// a time, which is the same arithmetic with N = 1.
+// Bengio et al. 2003, exactly as the video builds it. Torch processes a whole
+// batch at once, so every shape below starts with N. The C++ code runs one
+// example at a time, which is the same arithmetic with N = 1.
 //
 // Python:
 //   emb = C[X]                                   # (N, kBlock, embed)
@@ -255,12 +258,13 @@ Splits split_words(std::vector<std::string> words, std::mt19937& g) {
 //   logits = h @ W2 + b2                         # (N, kVocab)
 //   loss = F.cross_entropy(logits, Y)
 //
-// C is a lookup table, not a matrix multiply. The video spends a while on
-// one_hot(x) @ C before pointing out that it only ever selects a row - the
-// same observation the bigram file makes about its single weight matrix.
+// C is a lookup table, not a matrix multiply. The video spends some time on
+// one_hot(x) @ C before it points out that this only selects a row. The bigram
+// file makes the same observation about its single weight matrix.
 
-// Softmax over one row of kVocab logits. Subtracting the row max first costs
-// nothing and keeps exp() away from overflow; softmax is invariant to it.
+// Softmax over one row of kVocab logits. Subtracting the row maximum first
+// costs almost nothing and prevents overflow in exp(). It does not change the
+// result.
 //
 // Python: probs = F.softmax(logits, dim=1)
 void softmax(const double* logits, double* probs) {
@@ -277,8 +281,8 @@ void softmax(const double* logits, double* probs) {
 
 class Mlp {
 public:
-    // Per-example working memory. It lives outside the model so a caller
-    // allocates it once for a whole training run rather than once per example.
+    // Working memory for one example. It is kept outside the model, so that a
+    // caller allocates it once for a whole training run, not once per example.
     struct Scratch {
         std::vector<double> emb, hidden, logits, probs;
         std::vector<double> dlogits, dpre, demb;
@@ -300,9 +304,10 @@ public:
         //   b2 = torch.randn(27, generator=g)
         //   parameters = [C, W1, b1, W2, b2]
         //
-        // Nothing here is scaled by fan-in, which leaves tanh saturated and the
-        // starting loss absurdly high - that is the next video's subject, and
-        // section 4 prints the evidence for it before training starts.
+        // Nothing here is scaled by fan-in. That leaves tanh saturated and
+        // makes the starting loss extremely high. This is the subject of the
+        // next video, and section 4 prints the evidence before training
+        // starts.
         std::normal_distribution<double> randn(0.0, 1.0);
         for (std::vector<double>* p : { &C_, &W1_, &b1_, &W2_, &b2_ }) {
             for (double& v : *p) {
@@ -343,9 +348,10 @@ public:
         return s;
     }
 
-    // The forward pass for one example. Unchecked on purpose: validate_dataset
-    // has already established that every token indexes a real row of C, and
-    // this runs kBatch times per step for hundreds of thousands of steps.
+    // The forward pass for one example. There is no check here, on purpose:
+    // validate_dataset has already confirmed that every token is a valid row
+    // of C, and this runs kBatch times per step, for hundreds of thousands of
+    // steps.
     //
     // Python:
     //   emb = C[X]
@@ -386,18 +392,18 @@ public:
         return -std::log(s.probs[target]);
     }
 
-    // Forward and backward for one example: returns that example's loss and
-    // accumulates scale * d(loss)/d(parameter) into the gradients, so a caller
-    // averaging over a minibatch passes scale = 1/batch.
+    // Forward and backward for one example. Returns that example's loss, and
+    // adds scale * d(loss)/d(parameter) into the gradients. A caller that
+    // averages over a minibatch passes scale = 1/batch.
     //
-    // Written out by hand for the same reason as in the bigram file: an
-    // autograd graph over 32 examples and 11897 parameters, rebuilt 200000
-    // times, would dwarf the arithmetic it exists to organise.
+    // Written by hand for the same reason as in the bigram file. An autograd
+    // graph over 32 examples and 11897 parameters, built again 200000 times,
+    // would cost far more than the arithmetic it organises.
     double forward_backward(const int* ctx, int target, double scale, Scratch& s) {
         forward(ctx, s);
         softmax(s.logits.data(), s.probs.data());
 
-        // softmax followed by NLL collapses to probs - onehot(target).
+        // For softmax followed by NLL, the gradient is probs - onehot(target).
         for (int j = 0; j < kVocab; ++j) {
             s.dlogits[j] = (s.probs[j] - (j == target ? 1.0 : 0.0)) * scale;
             db2_[j] += s.dlogits[j];
@@ -412,8 +418,8 @@ public:
                 dw[j] += a * s.dlogits[j];
                 acc += w[j] * s.dlogits[j];
             }
-            // tanh' = 1 - tanh^2, and s.hidden already holds the tanh, so the
-            // pre-activation never has to be kept around.
+            // tanh' = 1 - tanh^2, and s.hidden already holds the tanh. So the
+            // value before the tanh does not have to be kept.
             s.dpre[h] = acc * (1.0 - a * a);
             db1_[h] += s.dpre[h];
         }
@@ -430,8 +436,9 @@ public:
             s.demb[k] = acc;
         }
 
-        // The embedding gradient scatters back into C, and += is load-bearing:
-        // a character appearing twice in one context contributes twice.
+        // The embedding gradient is added back into C, and the += is
+        // essential: a character that appears twice in one context
+        // contributes twice.
         for (int j = 0; j < kBlock; ++j) {
             double* dc = &dC_[ctx[j] * embed_];
             const double* de = &s.demb[j * embed_];
@@ -463,8 +470,8 @@ public:
         descend(b2_, db2_, lr);
     }
 
-    // Mean negative log likelihood over a whole split, in nats - the number
-    // the video quotes for train and dev.
+    // Mean negative log likelihood over a whole split, in nats. This is the
+    // number that the video reports for train and dev.
     //
     // Python:
     //   emb = C[Xdev]
@@ -495,8 +502,9 @@ public:
     //       if ix == 0:
     //           break
     std::string sample(std::mt19937& g) const {
-        // A model that never emits '.' would loop forever. The longest name in
-        // the dataset is 15 characters, so this can only mean something broke.
+        // A model that never produces '.' would loop forever. The longest name
+        // in the dataset has 15 characters, so reaching this limit can only
+        // mean that something is broken.
         constexpr size_t kMaxLength = 1000;
 
         Scratch s = scratch();
@@ -544,13 +552,13 @@ struct TrainConfig {
     int steps;
     int batch;
     double lr;
-    double lr_decayed;   // the video's learning rate decay: one 10x cut
+    double lr_decayed;   // the video's learning rate decay: one cut by 10x
     int decay_at;
 };
 
-// Minibatch SGD, the other half of what makes this model tractable: 32
-// examples give a gradient that points roughly the right way, and taking far
-// more approximate steps beats taking a few exact ones.
+// Minibatch SGD, the other thing that makes this model practical to train. 32
+// examples give a gradient that points roughly in the right direction, and
+// many approximate steps work better than a few exact ones.
 //
 // Python:
 //   for i in range(200000):
@@ -576,9 +584,9 @@ void train(Mlp& net, const Dataset& data, const TrainConfig& cfg, std::mt19937& 
     const double scale = 1.0 / cfg.batch;
     const int report_every = std::max(1, cfg.steps / 10);
 
-    // A 32-example loss is noisy enough that reading progress off it is
-    // guesswork, so carry an exponential moving average alongside it. The
-    // video reads the same trend off the scatter in its loss plot.
+    // The loss of 32 examples is so noisy that it shows progress only
+    // vaguely. So an exponential moving average is kept next to it. The video
+    // reads the same trend from the scattered points of its loss plot.
     double ema = 0.0;
     const auto t0 = std::chrono::steady_clock::now();
 
@@ -610,11 +618,11 @@ void train(Mlp& net, const Dataset& data, const TrainConfig& cfg, std::mt19937& 
     printf("  %d steps of batch %d in %.1fs\n", cfg.steps, cfg.batch, secs);
 }
 
-// The video's learning-rate hunt: train a throwaway network for a thousand
-// steps while raising the step size exponentially from 1e-3 to 1, and watch
-// for where the loss stops falling and starts climbing again. Karpathy reads
-// ~0.1 off the resulting plot; the bars below are that plot, one row per
-// bucket of steps.
+// The video's search for a learning rate: train a temporary network for a
+// thousand steps, while the step size grows exponentially from 1e-3 to 1, and
+// look for the point where the loss stops falling and starts rising again.
+// Karpathy reads ~0.1 from the resulting plot. The bars below are that plot,
+// with one row per group of steps.
 //
 // Python:
 //   lre = torch.linspace(-3, 0, 1000)
@@ -657,8 +665,8 @@ void find_learning_rate(const Dataset& data, int embed, int hidden, int batch,
         losses[step] = loss * scale;
     }
 
-    // Average within a bucket, because a single minibatch says very little. A
-    // bucket that has gone infinite or NaN is a result too: that is the
+    // Average within a group of steps, because a single minibatch says very
+    // little. A group with an infinite or NaN loss is also a result: it is the
     // right-hand end of the video's plot, where the step size is too large.
     const int per = kSweepSteps / kBuckets;
     std::vector<double> avg(kBuckets, 0.0);
@@ -699,9 +707,9 @@ void find_learning_rate(const Dataset& data, int embed, int hidden, int batch,
         lrs[best * per + per / 2]);
 }
 
-// The payoff of a 2-dimensional embedding: printed as a scatter plot, the
-// vowels have gathered in one region and the rare characters have been flung
-// out to the edges. Nobody told the network that vowels are a category.
+// The result of a 2-dimensional embedding, printed as a scatter plot: the
+// vowels are close together in one region, and the rare characters are far
+// out at the edges. Nobody told the network that vowels are a group.
 //
 // Python:
 //   plt.figure(figsize=(8, 8))
@@ -725,8 +733,8 @@ void print_embedding_scatter(const Mlp& net) {
         lo_y = std::min(lo_y, net.embedding(i, 1));
         hi_y = std::max(hi_y, net.embedding(i, 1));
     }
-    // A degenerate table collapsed onto a point would divide by zero here, and
-    // a flat axis is still worth a picture with everything in one row.
+    // If all embeddings were at one point, this would divide by zero. An axis
+    // with no spread still gets a picture, with everything in one row.
     const double span_x = std::max(hi_x - lo_x, 1e-12);
     const double span_y = std::max(hi_y - lo_y, 1e-12);
 
@@ -752,9 +760,9 @@ void print_embedding_scatter(const Mlp& net) {
 // The two configurations the video trains
 // ---------------------------------------------------------------------------
 
-// The small one exists for the picture: two embedding dimensions is what fits
+// The small configuration exists for the picture: two embedding dimensions fit
 // on a plot. The large one is the video's final model, and its 11897
-// parameters are the number Karpathy reads out.
+// parameters are the number that Karpathy reports.
 constexpr int kSmallEmbed = 2;
 constexpr int kSmallHidden = 100;
 constexpr int kSmallSteps = 30000;
@@ -767,8 +775,8 @@ constexpr int kBatch = 32;
 constexpr double kLearningRate = 0.1;
 constexpr double kDecayedRate = 0.01;
 
-// The video's numbers, named here so the Expect blocks below read as claims
-// rather than magic constants.
+// The video's numbers, named here so that the Expect blocks below read as
+// claims instead of unexplained constants.
 constexpr double kBigramLoss = 2.4541;     // what makemore_bigram.cpp scores
 constexpr double kVideoDevLoss = 2.17;     // the number this video finishes on
 
@@ -788,8 +796,8 @@ void test_makemore_mlp() {
     }
     printf("  %zu names, %d characters of context per example\n", words.size(), kBlock);
 
-    // The sliding window, spelled out for the first few names the way the
-    // video does before it trusts build_dataset.
+    // The sliding window, printed in full for the first few names, as the
+    // video does before it relies on build_dataset.
     const std::vector<std::string> first_few(
         words.begin(), words.begin() + std::min<size_t>(3, words.size()));
     std::cout << "  the window, for";
@@ -802,10 +810,10 @@ void test_makemore_mlp() {
 
     std::cout << "\n== 1. train / dev / test ==\n";
     // random.seed(42); random.shuffle(words) in the video. mt19937 and
-    // std::shuffle do not reproduce Python's stream, so which names land in
-    // which split differs: the per-split example counts below come out a few
-    // hundred off the video's 182625 / 22655 / 22866, and the losses drift in
-    // the last digit or two for the same reason.
+    // std::shuffle do not reproduce Python's random numbers, so different
+    // names go into each split. The example counts per split below differ by
+    // a few hundred from the video's 182625 / 22655 / 22866, and the losses
+    // differ in the last digit or two for the same reason.
     std::mt19937 split_rng(42);
     const Splits splits = split_words(words, split_rng);
     const Dataset train_set = build_dataset(splits.train);
@@ -821,9 +829,9 @@ void test_makemore_mlp() {
     printf("  test  %6zu names, %7zu examples  (never touched below)\n",
         splits.test.size(), test_set.size());
 
-    // Every name contributes one example per character plus one for the
-    // terminating '.', so however the shuffle falls the three splits have to
-    // add up to the 228146 bigrams the previous file counts.
+    // Every name contributes one example per character, plus one for the final
+    // '.'. So for any shuffle, the three splits together must have the 228146
+    // examples that the previous file counts as bigrams.
     sanity::Expect data;
     data.equal("train names", static_cast<double>(splits.train.size()), 25626);
     data.equal("dev names", static_cast<double>(splits.dev.size()), 3203);
@@ -850,8 +858,9 @@ void test_makemore_mlp() {
     printf("  train %.4f  dev %.4f\n", small_train, small_dev);
     print_embedding_scatter(small);
 
-    // Two dimensions is a real bottleneck - the video's reason for widening it
-    // - but it should already be ahead of counting bigrams.
+    // Two dimensions are a real limit, which is why the video makes the
+    // embedding wider. But even this model should already beat the bigram
+    // counts.
     sanity::Expect small_chk;
     small_chk.equal("parameters", static_cast<double>(small.parameters()), 3481);
     small_chk.that("beats the bigram model", small_dev < kBigramLoss);
@@ -862,9 +871,10 @@ void test_makemore_mlp() {
     printf("  %d embedding dims, %d hidden units, %zu parameters\n",
         net.embed(), net.hidden(), net.parameters());
 
-    // -log(1/27) is what a model that knows nothing at all scores. The
-    // untrained net is far worse than that: randn weights leave it confidently
-    // wrong rather than uniformly unsure, which is where the next video starts.
+    // -log(1/27) is the score of a model that knows nothing at all. The
+    // untrained net is far worse than that: with randn weights, it is
+    // confidently wrong instead of equally unsure about every character. The
+    // next video starts from this problem.
     const double uniform_loss = std::log(static_cast<double>(kVocab));
     const double initial_dev = net.evaluate(dev_set);
     printf("  before training: dev %.4f  (a uniform guess would score %.4f)\n",
@@ -881,11 +891,11 @@ void test_makemore_mlp() {
         train_loss, dev_loss, kVideoDevLoss);
     printf("  bigram model, for comparison: %.4f\n", kBigramLoss);
 
-    // The claim of the video, checked rather than asserted in a comment: three
-    // characters of context and a hidden layer beat counting bigrams, and
-    // train and dev staying close says the model is still too small to overfit
-    // this dataset. The dev tolerance is wide because the split is not the
-    // video's - see the note in section 1.
+    // The claim of the video, checked in code instead of stated in a comment:
+    // three characters of context and a hidden layer beat counting bigrams.
+    // Train and dev losses that stay close show that the model is still too
+    // small to overfit this dataset. The dev tolerance is wide because the
+    // split differs from the video's; see the note in section 1.
     sanity::Expect chk;
     chk.equal("parameters", static_cast<double>(net.parameters()), 11897);
     chk.that("training helped", dev_loss < initial_dev);

@@ -2,9 +2,9 @@ GptScaled - how it works
 ========================
 
 Notes on gpt_scaled: the model it trains, how each batch is shared between
-the GPU and the CPU, and the two engines that do the arithmetic - the blocked
+the GPU and the CPU, and the two engines that do the arithmetic: the blocked
 AVX2 multiply on the CPU and the CUDA kernels on the GPU. Written 2026-10-09
-from the code in this directory; file and function names refer to this
+from the code in this directory. File and function names refer to this
 directory's copies.
 
 
@@ -56,8 +56,8 @@ and V (no bias). Head h owns channels [64h, 64h + 64) of each:
     out_h  = P V_h                          T x 64
     the six out_h side by side are the 384 channels that Wp projects
 
-Initial weights are normal(0, 0.02) everywhere and biases zero - the video's
-_init_weights.
+Initial weights are normal(0, 0.02) everywhere, and biases are zero, as in
+the video's _init_weights.
 
 Parameters, 10,788,929 in all (the video prints 10.788929 M):
 
@@ -95,14 +95,14 @@ gpt_scaled holds the model twice, in SplitModel:
     hands gradients back. Its own AdamW is never called.
 
 Both keep their tensors in the same order (checked in the constructor), so
-weights and gradients can be walked side by side.
+the code can go through both sets of weights and gradients together.
 
 
 1.3 One training step
 
     1. Draw 64 random windows from the training text: x is 256 characters,
        y is the same window shifted by one.
-    2. Deal them out: the first n windows to the GPU, the other 64 - n to
+    2. Divide them: the first n windows go to the GPU, the other 64 - n to
        the CPU.
     3. Run both halves at once. The GPU half runs on a std::async thread,
        which spends its time waiting on the device. The CPU half runs on the
@@ -110,20 +110,20 @@ weights and gradients can be walked side by side.
        a core for the GPU's driver thread (kGpuDriverThreads).
     4. The GPU takes its n windows as c calls of k windows each (k <= 16).
        Its backward kernels add into the gradient buffer rather than
-       overwrite it, so the c gradients pile up on the device and cross to
-       the host in one copy at the end.
+       overwrite it. So the c gradients are summed on the device and copied
+       to the host once, at the end.
     5. Combine into the mean over the whole batch (combine()):
 
            g = (k / B) * (g_1 + ... + g_c)  +  ((B - n) / B) * g_cpu
 
     6. AdamW on the CPU, then the new weights to the GPU in one 43 MB copy.
 
-Why the GPU's weight is k/B and not n/B: each call's loss is the mean over
-that call's k windows, so the device holds a sum of c means. Every window
-should count 1/B; inside a chunk's mean it counts 1/k; so the pile is scaled
-by k/B. That only works if every chunk is the same size, so the GPU's share
-is rounded down to a multiple of its chunk count (38 wanted becomes
-3 x 12 = 36).
+Why the GPU's scale factor is k/B and not n/B: each call's loss is the mean
+over that call's k windows, so the device holds a sum of c means. Every
+window should count 1/B. Inside a chunk's mean it counts 1/k. So the sum is
+scaled by k/B. That only works if every chunk has the same size, so the
+GPU's share is rounded down to a multiple of its chunk count (38 wanted
+becomes 3 x 12 = 36).
 
 
 1.4 Why chunks at all
@@ -138,31 +138,33 @@ the same buffers. The weights, gradients and both Adam moments together are
 only 173 MB.
 
 
-1.5 Balancing the split
+1.5 Balancing the GPU/CPU split
 
 Every step times both halves. The time per window on each side goes into a
 running average (kSmoothing = 0.25), and the GPU's share becomes
 
     share = cpu_s_per_window / (gpu_s_per_window + cpu_s_per_window)
 
-which is the split at which both sides finish together. It starts at 0.6
-(kInitialGpuShare, from the two bench throughputs) and settles within a few
-dozen steps. Each side always gets at least one window, so that both keep
-being timed. The first step is not counted, because it pays for first touch.
+which is the share at which both sides finish at the same time. It starts at
+0.6 (kInitialGpuShare, from the two bench throughputs) and becomes stable
+within a few dozen steps. Each side always gets at least one window, so that
+both are always timed. The first step is not counted, because it includes
+one-time costs such as the first touch of new memory.
 
-Evaluation (estimate_loss: 200 batches of each split, dropout off) is shared
-the same way, forward passes only. The loss is the two sides' means weighted
-by how many windows each saw.
+Evaluation (estimate_loss: 200 batches of the training and validation sets,
+dropout off) is shared in the same way, with forward passes only. The loss
+is the mean of the two sides' losses, each counted in proportion to its
+number of windows.
 
 
 1.6 What the program does, in order
 
     0. Load the corpus.
-    1. Check the split: one forward and backward pass at the full shape
-       (6 windows, dropout off, the GPU in chunks of 2) against the scalar
-       reference from the same weights. The loss has to agree to 1e-4 and
-       every gradient tensor to 1e-3 of its largest entry. This is what
-       proves the k/B weighting.
+    1. Check the GPU/CPU split: one forward and backward pass at the full
+       shape (6 windows, dropout off, the GPU in chunks of 2), compared with
+       the scalar reference from the same weights. The loss has to agree to
+       1e-4, and every gradient tensor to 1e-3 of its largest entry. This
+       check shows that the k/B scale factor is correct.
     2. Train 5000 steps, or load the checkpoint if one is beside input.txt.
        It uses gpt_model.h's format and name, so gpt.cpp's scale-up branch
        and the chat tool find it too. Delete it to train again.
@@ -171,9 +173,9 @@ by how many windows each saw.
     4. Sample 1000 characters on the CPU, because gpt_cuda.h returns losses
        and never logits. Each character is a full forward pass over the last
        256 characters or fewer. There is no KV cache, and an exact one would
-       only help the first 256 characters: once the window slides, every
-       character moves one position, so its wpe row - and with it its keys
-       and values in every layer - changes.
+       only help the first 256 characters. Once the window slides, every
+       character moves one position, so its wpe row changes, and with it its
+       keys and values in every layer.
 
 
 1.7 Measured
@@ -182,9 +184,9 @@ The run of 2026-10-01 on the i9-9900KF and the GTX 1050 Ti took about
 3 hours: 144 minutes of training at about 1733 ms a step (about 639 GFLOP/s
 for the two devices together), settling at 45 windows on the GPU (3 chunks
 of 15) and 19 on the CPU, plus 39 minutes of evaluations. Validation loss
-bottomed at 1.4764 at step 2500, then rose to 1.5615 by the end while the
-training loss kept falling - overfitting - so the 1.48 check failed. That run
-predates the fix to the GPU's dropout seeds (see 3.6).
+was lowest at step 2500 (1.4764), then rose to 1.5615 by the end, while the
+training loss kept falling. That is overfitting, so the 1.48 check failed.
+That run was made before the fix to the GPU's dropout seeds (see 3.6).
 
 
 2. The vectorised CPU multiply (gpt_gemm.h), in a nutshell
@@ -195,11 +197,12 @@ predates the fix to the GPU's dropout seeds (see 3.6).
 Nearly all of the arithmetic is matrix multiplication: every Linear layer
 (out = x W + b forward; dx = dout W^T and dW += x^T dout backward) and
 attention's products for each (batch, head). gpt_model.h writes these as
-plain loops - for each row, for each input channel, add a scaled row of W.
-That threads well but runs at a few percent of the chip, for two reasons:
+plain loops: for each row, for each input channel, add a scaled row of W.
+That works well with threads, but reaches only a few percent of the chip's
+peak speed, for two reasons:
 
-  - each row of x streams the whole weight matrix through the cache, so the
-    loops wait on memory;
+  - each row of x reads the whole weight matrix through the cache, so the
+    loops wait for memory;
   - MSVC was not turning the loops into vector code (measured: /arch:AVX2,
     and switching double to float, changed nothing).
 
@@ -225,18 +228,19 @@ copied ("packed") into exactly the order the innermost loop will read it:
 
     for each 3072-column slab of B (NC)
       for each 256-deep slice of k (KC)
-        pack B (KC x NC) into 16-column slivers      3 MB, lives in L3
+        pack B (KC x NC) into 16-column slivers      3 MB, stays in L3
         for each 120-row block of A (MC)
-          pack A (MC x KC) into 6-row panels         120 KB, lives in L2
+          pack A (MC x KC) into 6-row panels         120 KB, stays in L2
           for each sliver (16 columns) and panel (6 rows)
             micro-kernel: C tile (6 x 16) += panel (6 x KC) * sliver (KC x 16)
                                                      a sliver is 16 KB, in L1
 
-Packing pays for itself. It turns strided or transposed reads into one
-sequential stream; it absorbs the transpose flags, so A*B, A*B^T and A^T*B
-all run the same inner code; and it pads the edges with zeros, so the
-micro-kernel always computes a full 6 x 16 tile. A tile hanging off the edge
-of C is computed into a scratch tile and only its valid part added in.
+Packing saves more time than it costs. It turns strided or transposed reads
+into one sequential stream. It handles the transpose flags, so A*B, A*B^T
+and A^T*B all run the same inner code. And it pads the edges with zeros, so
+the micro-kernel always computes a full 6 x 16 tile. A tile that extends past
+the edge of C is computed into a scratch tile, and only its valid part is
+added to C.
 
 
 2.4 The micro-kernel (AVX2 + FMA)
@@ -247,30 +251,30 @@ AVX2 has sixteen 256-bit registers of 8 floats each. The tile uses 15:
      2  the current row of the B sliver (16 floats)
      1  one element of A, broadcast to all 8 lanes
 
-Each step along k is 2 loads, 6 broadcasts and 12 fused multiply-adds -
-192 flops for 8 memory operations. After KC steps the tile is scaled by
-alpha and added into C. The accumulators are twelve named variables rather
-than an array, so that the compiler keeps them in registers for the whole
-loop.
+Each step along k is 2 loads, 6 broadcasts and 12 fused multiply-adds:
+192 flops for 8 memory operations. After KC steps, the tile is scaled by
+alpha and added to C. The accumulators are twelve named variables, not an
+array, so that the compiler keeps them in registers for the whole loop.
 
 It is compiled in only for float, and only when AVX2 and FMA are available
-(/arch:AVX2 on MSVC, -march=native on clang). Anything else - including a
-double build - gets a portable version of the same 6 x 16 tile in plain
+(/arch:AVX2 on MSVC, -march=native on clang). Every other case, including a
+double build, uses a portable version of the same 6 x 16 tile in plain
 loops.
 
 
 2.5 Threads and determinism
 
-With OpenMP the team packs one B slab together (each thread some of the
-slivers), waits at a barrier, then splits the (A block, B sliver) pairs into
-contiguous runs, one per thread. Pairs rather than whole A blocks, because a
-weight gradient has only 384 rows - 4 blocks, too few for 16 threads. A
-second barrier keeps anyone from repacking B while it is still being read.
+With OpenMP, the team packs one B slab together (each thread packs some of
+the slivers) and waits at a barrier. Then it divides the (A block, B sliver)
+pairs into contiguous ranges, one per thread. The work is divided into pairs,
+not only into A blocks, because a weight gradient has only 384 rows: 4
+blocks, too few for 16 threads. A second barrier stops any thread from
+packing the next B slab while the current one is still being read.
 
-Every element of C is written by exactly one thread, adding its KC slices in
-order, so the result is bit for bit the same whatever the team size. It is
-not bit for bit the scalar loops' result (FMA and blocked summation), only
-equal to float rounding.
+Every element of C is written by exactly one thread, which adds its KC slices
+in order. So the result is exactly the same, bit for bit, for any number of
+threads. It is not bit for bit the same as the scalar loops' result (because
+of FMA and blocked summation); it agrees with it to float rounding.
 
 Multiplies under 262,144 multiply-adds stay on the calling thread.
 Attention parallelises over (batch, head) itself and calls gemm with
@@ -286,9 +290,10 @@ the embedding-gradient scatter stay serial on purpose.
 
 On the i9-9900KF (8 cores, 16 threads), at 384 channels / 6 heads / 6 layers,
 context 64, batch 16 (gpt_blocked): 208 ms a step against 1531 ms for the
-threaded scalar loops - 7.3x, 319 GFLOP/s, about a quarter of the chip's
-float peak. On the 32-channel walkthrough model it is only 1.43x: with loops
-8 to 128 long, there is too little to vectorise.
+threaded scalar loops. That is 7.3x faster, 319 GFLOP/s, about a quarter of
+the chip's float peak. On the 32-channel walkthrough model it is only 1.43x
+faster: with loops 8 to 128 iterations long, there is too little to
+vectorise.
 
 
 3. The CUDA model (gpt_cuda.cu), in a nutshell
@@ -296,9 +301,9 @@ float peak. On the 32-channel walkthrough model it is only 1.43x: with loops
 
 3.1 The boundary
 
-gpt_cuda.h is plain C++: a Model class with an opaque Impl that speaks
-std::vector<float>. Everything CUDA lives in gpt_cuda.cu, so nvcc never
-compiles gpt_model.h and the host code never sees a CUDA type. The interface
+gpt_cuda.h is plain C++: a Model class with an opaque Impl that uses
+std::vector<float>. Everything CUDA is in gpt_cuda.cu, so nvcc never
+compiles gpt_model.h, and the host code never sees a CUDA type. The interface
 is load weights, forward_backward / forward_loss, read_grads, zero_grad,
 set_training, adamw_step and sync. Float only: the GTX 1050 Ti runs double at
 1/32 of its float rate.
@@ -306,7 +311,7 @@ set_training, adamw_step and sync. Float only: the GTX 1050 Ti runs double at
 
 3.2 Memory
 
-All parameters live in one flat device buffer, and so do the gradients and
+All parameters are in one flat device buffer, and so are the gradients and
 both Adam moments, in the same tensor order as gpt::Gpt. zero_grad is one
 memset, AdamW is one launch over 10.8M elements, and weights in or gradients
 out are one memcpy each.
@@ -315,8 +320,8 @@ Each block keeps what its backward pass needs (BlockActs: the LayerNorm
 outputs and inverse deviations, Q, K, V, the attention probabilities, the
 dropout masks, the feed-forward's hidden layer, and so on). The backward
 scratch is shared by all six blocks, since only one runs backward at a time.
-Buffers grow to fit the largest call and never shrink - which is why
-gpt_scaled bounds the size of a call.
+Buffers grow to fit the largest call and never shrink. That is why
+gpt_scaled limits the size of a call.
 
 
 3.3 Three kinds of kernel
@@ -328,24 +333,24 @@ gpt_scaled bounds the size of a call.
     hundred numbers. Each lane takes every 32nd element, and the lanes
     combine their sums and maxima with __shfl_xor_sync butterflies, without
     touching shared memory.
-  - The matrix multiply, where the time goes.
+  - The matrix multiply, which takes most of the time.
 
 
 3.4 The multiply (gemm_kernel)
 
-The textbook shared-memory tiled SGEMM:
+The standard shared-memory tiled SGEMM from textbooks:
 
-  - A block of 16 x 16 = 256 threads owns a 64 x 64 tile of C.
-  - It walks k in steps of 16. At each step the block loads a 64 x 16 slab
-    of A and a 16 x 64 slab of B into shared memory, each padded by one
-    column against bank conflicts. The loads follow the operand's stored
-    order, so neighbouring threads read neighbouring addresses even when the
-    operand is transposed.
+  - A block of 16 x 16 = 256 threads computes a 64 x 64 tile of C.
+  - It goes through k in steps of 16. At each step the block loads a
+    64 x 16 slab of A and a 16 x 64 slab of B into shared memory, each
+    padded by one column against bank conflicts. The loads follow the
+    operand's stored order, so neighbouring threads read neighbouring
+    addresses even when the operand is transposed.
   - Each thread accumulates a 4 x 4 piece of the tile in registers: for each
     of the 16 k values it reads 4 values of A and 4 of B from shared memory
     and does 16 fused multiply-adds. The piece is strided (rows ty, ty+16,
-    ty+32, ty+48, and likewise columns), so a warp reading the slab hits
-    consecutive words.
+    ty+32, ty+48, and the same for columns), so a warp reading the slab
+    reads consecutive words.
   - At the end the tile is scaled by alpha, gets a per-column bias if one was
     given, and is written into C or added to it.
   - The two transpose flags are template parameters (four instantiations),
@@ -353,10 +358,11 @@ The textbook shared-memory tiled SGEMM:
   - It is batched: blockIdx.z picks a (batch, head) pair, and per-operand
     strides say where that pair's matrices start. Each of attention's
     products is one launch covering all 64 x 6 (batch, head) pairs, with each
-    head addressed as a 64-column slice of a (B, T, C) tensor - no copies.
+    head addressed as a 64-column slice of a (B, T, C) tensor, without
+    copies.
 
-It is gpt_gemm.h's idea one level down: shared memory plays the packed
-L1/L2 blocks, and registers play registers.
+It is the same idea as gpt_gemm.h, one level lower: shared memory has the
+role of the packed L1/L2 blocks, and registers have the role of registers.
 
 
 3.5 Attention on the GPU
@@ -364,10 +370,10 @@ L1/L2 blocks, and registers play registers.
 Forward: three gemms for Q, K and V; one batched gemm for the scores of every
 (batch, head); the causal softmax in place (a warp per row, the future set to
 zero); dropout; one batched gemm of P by V; then the Wp projection with its
-bias folded into the gemm. As on the CPU, the full T x T square is computed
-and the masked half discarded, in exchange for plain rectangular multiplies.
-The backward pass mirrors it with four more batched gemms and a softmax
-backward.
+bias added inside the gemm. As on the CPU, the full T x T square is computed
+and the masked half is discarded; in return, the multiplies are plain
+rectangles. The backward pass does the same steps in reverse, with four more
+batched gemms and a softmax backward.
 
 
 3.6 The same bits every run
@@ -404,6 +410,7 @@ That is the property gpt_scaled's chunking relies on.
 
 GTX 1050 Ti: Pascal, sm_61, 6 SMs, 4 GB. It needs CUDA 12.x, since CUDA 13
 dropped Pascal. At the bench shape (384 / 6 / 6, context 64, batch 16) it
-ran 132 ms a step, 504 GFLOP/s - 1.58x the blocked CPU multiply, about a
-quarter of the card's float peak. In gpt_scaled, at context 256, it settled
-at about 70% of each batch (45 of 64 windows).
+ran 132 ms a step, 504 GFLOP/s. That is 1.58x the speed of the blocked CPU
+multiply, and about a quarter of the card's float peak. In gpt_scaled, at
+context 256, its share became stable at about 70% of each batch (45 of 64
+windows).

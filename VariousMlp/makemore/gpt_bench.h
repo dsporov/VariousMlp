@@ -1,28 +1,30 @@
-// gpt_bench.h - the bench every other implementation of the model is put on.
+// gpt_bench.h - the test bench for every other implementation of the model.
 //
 // gpt_model.h is the reference. The walkthrough checks every backward pass in
-// it against central differences, and every number the walkthrough prints came
-// out of it. The files that implement the same model some other way -
-// gpt_blocked.cpp with a cache-blocked multiply, gpt_aten.cpp on ATen tensors,
-// gpt_cuda.cu on the GPU - are checked against it here instead of against
-// central differences again, because agreeing with a model already known to
-// be right is a far tighter test than a finite difference in float can be.
+// it against central differences, and every number that the walkthrough
+// prints comes from it. The files that implement the same model in another
+// way are checked against it here: gpt_blocked.cpp with a cache-blocked
+// multiply, gpt_aten.cpp with ATen tensors, and gpt_cuda.cu on the GPU. They
+// are not checked against central differences again. Agreement with a model
+// that is already known to be correct is a much stricter test than a finite
+// difference in float can be.
 //
-// Three sections, each with the reference and the candidate side by side:
+// There are three sections, each with the reference and the candidate side by
+// side:
 //
-//   1. gradients. The candidate is loaded with the reference's weights and
+//   1. gradients. The candidate is loaded with the reference's weights, and
 //      both run one forward and backward pass on the same batch. Every
 //      gradient tensor has to agree to float rounding.
 //   2. training. The walkthrough's model for 5000 steps, from the same weights
-//      on the same batches. The two runs part ways in the last bits on the
-//      first step, so the curves are not identical, but they have to arrive
-//      at the same loss.
+//      on the same batches. The two runs already differ in the last bits after
+//      the first step, so the curves are not identical. But they have to reach
+//      the same loss.
 //   3. throughput, at the scaled-up model's width, where the multiplies are
-//      finally large enough for a faster implementation to show.
+//      large enough for a faster implementation to make a difference.
 //
-// A candidate is any class with the members below. Duck-typed rather than
-// derived from a base class, so that each backend keeps its own types to
-// itself - the CUDA one never shows the host code a device pointer.
+// A candidate is any class with the members below. It does not derive from a
+// base class (duck typing), so each backend keeps its own types to itself.
+// For example, the CUDA backend never shows a device pointer to the host code.
 //
 //   Candidate(...)                       shapes only; the weights come from load()
 //   void load(const std::vector<Param>& weights)
@@ -33,13 +35,13 @@
 //   real forward_backward(const int* x, const int* y, int B, int T)
 //   real forward_loss(const int* x, const int* y, int B, int T)
 //   void set_training(bool training)
-//   void adamw_step(real lr)             the optimiser lives where the weights do
-//   void sync()                          wait for queued work, so the clock is honest
+//   void adamw_step(real lr)             runs where the weights are
+//   void sync()                          waits for queued work (for timing)
 //   std::string describe() const
 //
-// The sections take a factory, make(cfg, vocab), returning a
-// std::unique_ptr<Candidate>, so each backend decides for itself what else it
-// needs - a device, say - to be constructed.
+// The sections take a factory, make(cfg, vocab), which returns a
+// std::unique_ptr<Candidate>. So each backend decides for itself what else it
+// needs to be constructed, for example a device.
 
 #pragma once
 
@@ -60,28 +62,30 @@ namespace gpt {
 namespace bench {
 
 // A gradient tensor has to match the reference's to this fraction of its
-// largest entry. Float rounding in a different order lands around 1e-6 to
-// 1e-5; a wrong or missing term lands near 1.
+// largest entry. Float rounding in a different order gives errors of about
+// 1e-6 to 1e-5. A wrong or missing term gives errors of about 1.
 constexpr double kGradTolerance = 1e-3;
 
-// The loss of one forward pass, same weights, same batch.
+// For the loss of one forward pass, with the same weights and the same batch.
 constexpr double kLossTolerance = 1e-4;
 
-// Two float runs of 5000 steps part ways on the first step, the way two runs
-// from different seeds would, so their final losses agree only to about the
-// noise in a 200-batch estimate. A mistake in a backward pass shows up in
-// section 1 long before it could hide inside this.
+// Two float runs of 5000 steps start to differ at the first step, like two
+// runs from different seeds. So their final losses agree only to about the
+// noise of an estimate over 200 batches. A mistake in a backward pass is
+// already caught in section 1, so it cannot hide inside this tolerance.
 constexpr double kTrainedTolerance = 0.05;
 
-// Section 3's shape: the scaled-up model's width and depth at a quarter of its
-// context and batch. Big enough that a multiply finally has something to
-// block, small enough that the scalar reference gets through a step in seconds
-// and that the activations fit in the 4GB of a GTX 1050 Ti.
+// The shape for section 3: the scaled-up model's width and depth, with a
+// quarter of its context and batch. It is big enough for blocking to make a
+// difference in the multiplies. It is small enough that the scalar reference
+// finishes a step in seconds, and that the activations fit in the 4GB of a
+// GTX 1050 Ti.
 constexpr int kBenchBlock = 64;
 constexpr int kBenchBatch = 16;
 
-// Each model is timed until this much wall clock has gone by, after one
-// untimed step that pays for allocation, first touch and starting threads.
+// Each model is timed until this much wall-clock time has passed. Before
+// that, one untimed step takes the one-time costs: allocation, the first
+// touch of new memory, and starting the threads.
 constexpr double kBenchSeconds = 3.0;
 constexpr int kBenchMaxSteps = 50;
 
@@ -94,8 +98,8 @@ inline double seconds_since(Clock::time_point t0) {
     return std::chrono::duration<double>(Clock::now() - t0).count();
 }
 
-// The reference, and gpt_blocked.cpp's candidate: the walkthrough's Gpt and
-// AdamW, with the process-wide kernel switch set around every call.
+// The reference, and also gpt_blocked.cpp's candidate: the walkthrough's Gpt
+// and AdamW, with the process-wide kernel switch set around every call.
 class CpuModel {
 public:
     CpuModel(const Config& cfg, int vocab, Kernels kernels, std::mt19937& g)
@@ -103,7 +107,7 @@ public:
     {
     }
 
-    // model_ holds the addresses opt_ was given.
+    // opt_ holds addresses inside model_, so the object must not be copied.
     CpuModel(const CpuModel&) = delete;
     CpuModel& operator=(const CpuModel&) = delete;
 
@@ -159,7 +163,8 @@ public:
     }
 
 private:
-    // Sets the switch for the length of one call and puts back what was there.
+    // Sets the switch during one call, and restores the previous value
+    // afterwards.
     class Using {
     public:
         explicit Using(Kernels k) : saved_(active_kernels()) { active_kernels() = k; }
@@ -176,9 +181,9 @@ private:
     AdamW opt_;
 };
 
-// gradient_check()'s precaution: gamma starts at exactly 1 and every bias at
-// exactly 0, and those are the values most likely to let a wrong expression
-// agree with a right one by accident.
+// The same precaution as in gradient_check(): gamma starts at exactly 1 and
+// every bias at exactly 0. With those values, a wrong expression is most
+// likely to agree with the correct one by accident.
 inline void jitter(std::vector<Param>& params, std::mt19937& g) {
     std::normal_distribution<real> noise(real(0), real(0.3));
     for (Param& p : params) {
@@ -189,9 +194,9 @@ inline void jitter(std::vector<Param>& params, std::mt19937& g) {
 }
 
 // The largest difference between two tensors, as a fraction of the largest
-// entry in either. Relative to the tensor rather than element by element,
-// because an entry that should be zero comes out as rounding noise on both
-// sides and the ratio of two noises means nothing.
+// entry in either one. It is relative to the whole tensor, not to each
+// element. An entry that should be zero comes out as rounding noise on both
+// sides, and the ratio of two noise values means nothing.
 inline double tensor_error(const std::vector<real>& a, const std::vector<real>& b) {
     double diff = 0.0;
     double scale = 0.0;
@@ -224,7 +229,7 @@ inline double worst_error(const std::vector<Param>& names,
     return worst;
 }
 
-// One optimiser step, from zeroing the gradients to the weights having moved.
+// One timed optimiser step, from zeroing the gradients to the updated weights.
 template <class Model>
 double timed_step(Model& m, const std::vector<int>& x, const std::vector<int>& y,
     int B, int T, real lr) {
@@ -318,8 +323,8 @@ void train_side_by_side(const Data& d, const char* label, Make make) {
     print_config(cfg);
     printf("  %d steps each, from the same weights on the same batches\n", kIters);
 
-    // Seeded exactly as the walkthrough's section 6, so the reference column
-    // below is the run that section prints.
+    // Seeded exactly like section 6 of the walkthrough, so the reference
+    // column below is the same run that section prints.
     std::mt19937 g(1337);
     CpuModel ref(cfg, d.vocab, Kernels::kScalar, g);
     std::unique_ptr<Candidate> cand = make(cfg, d.vocab);
@@ -401,8 +406,9 @@ void throughput(const Data& d, const char* label, Make make) {
     printf("  %-9s  %9.1f ms a step  %8.1f GFLOP/s  (%d timed)  %.1fx\n", label,
         1e3 * cand_s, flops / cand_s / 1e9, cand_steps, ref_s / cand_s);
 
-    // The full run differs from this shape only in context and batch, so its
-    // parameter count is this one's plus the extra rows of the position table.
+    // The full run differs from this shape only in context and batch. So its
+    // parameter count is this shape's count plus the extra rows of the
+    // position table.
     const Config big{ kBigEmbed, kBigHeads, kBigLayers, kBigBlock, kBigBatch,
         kBigDropout, kBigLr };
     const size_t big_params = params

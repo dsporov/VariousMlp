@@ -11,13 +11,14 @@ void test_gpt_chat();
 
 int main(int argc, char** argv)
 {
-    // The hard checks (CHECK in makemore/check.h) throw, so catch them here and
-    // print the file:line instead of letting the runtime pop a dialog.
+    // The hard checks (CHECK in makemore/check.h) throw. So they are caught
+    // here, and the file:line is printed, instead of the runtime showing an
+    // error dialog.
     try {
-        // The walkthroughs take minutes and end by training a model; the prompt
-        // that model feeds wants to start immediately. `VariousMlp.exe chat`
-        // skips straight to it. In Visual Studio: Debugging -> Command
-        // Arguments.
+        // The walkthroughs take minutes and end by training a model. The
+        // prompt that uses this model should start immediately, and
+        // `VariousMlp.exe chat` goes directly to it. In Visual Studio, set this
+        // under Debugging -> Command Arguments.
         if (argc > 1 && std::string(argv[1]) == "chat") {
             test_gpt_chat();
             return 0;

@@ -1,44 +1,46 @@
-// GptScaled's own copy of makemore/gpt_gemm.h, taken at commit 512eaaa and
-// otherwise unchanged, so that the two diff cleanly. gpt_scaled compiles only
-// the files in this directory, which keeps it independent of makemore/: a
-// change on either side stays on that side. Where the comments below mention
-// other files, they mean the ones in makemore/.
+// GptScaled's own copy of makemore/gpt_gemm.h, copied at commit 512eaaa.
+// Later changes went into both copies, so a diff between the two shows only
+// this note. gpt_scaled compiles only the files in this directory, which keeps
+// it independent of makemore/: a change to one copy does not reach the other.
+// Where the comments below mention other files, they mean the files in
+// makemore/.
 //
 // gpt_gemm.h - a cache-blocked, vectorised matrix multiply for gpt_model.h.
 //
-// The layers in gpt_model.h are written the way the arithmetic reads: for every
-// row, for every input channel, add a scaled row of weights into the output.
-// That is correct and it threads well, and on the i9 it reaches about 2% of
-// what the chip can do. Two things stand between it and the rest:
+// The layers in gpt_model.h are written in the same order as the arithmetic:
+// for every row, for every input channel, add a scaled row of weights to the
+// output. That code is correct and works well with threads, but on the i9 it
+// reaches only about 2% of the chip's peak speed. There are two reasons:
 //
-//   - every row of the input streams the whole weight matrix past the cache,
-//     so at the scaled-up width the arithmetic waits on memory rather than the
-//     other way round.
-//   - neither /arch:AVX2 nor switching the scalar to float moved the measured
-//     rate, which says the compiler is not turning those loops into vector
-//     code on its own.
+//   - every row of the input reads the whole weight matrix through the cache.
+//     So at the scaled-up width, the arithmetic waits for memory.
+//   - neither /arch:AVX2 nor switching the scalar type to float changed the
+//     measured speed. This shows that the compiler does not turn those loops
+//     into vector code by itself.
 //
-// This file is the standard answer to both, the one every BLAS since GotoBLAS
-// has used. The multiply is cut into blocks sized to the caches - a KC-deep
-// slab of B that lives in L3, an MC x KC block of A that lives in L2, a
-// KC x NR sliver of B that lives in L1 - and each block is copied ("packed")
-// into exactly the order the innermost loop will read it. The innermost loop
-// then holds a 6 x 16 tile of C in registers while KC rank-one updates stream
-// through it, and that tile is the only place the floating point units see
-// any work.
+// This file uses the standard solution to both problems, which every BLAS
+// library has used since GotoBLAS. The multiply is cut into blocks that fit
+// the caches: a KC-deep slab of B that stays in L3, an MC x KC block of A that
+// stays in L2, and a KC x NR sliver of B that stays in L1. Each block is
+// copied ("packed") into exactly the order in which the innermost loop reads
+// it. The innermost loop keeps a 6 x 16 tile of C in registers while it adds
+// KC rank-one updates to it. All of the floating point work happens in that
+// tile.
 //
-// Everything is row-major, with a transpose flag per operand, because the
-// three multiplies of a Linear layer want A*B, A*B^T and A^T*B and packing is
-// the natural place to absorb the difference. C is always added into, never
-// overwritten: every caller in gpt_model.h hands in either a buffer that
-// Matrix::resize has just zeroed or a gradient that is meant to be summed into.
+// Everything is row-major, with a transpose flag for each operand. The three
+// multiplies of a Linear layer need A*B, A*B^T and A^T*B, and packing is the
+// natural place to handle that difference. The result is always added to C;
+// C is never overwritten. Every caller in gpt_model.h passes either a buffer
+// that Matrix::resize has just zeroed, or a gradient that is meant to be
+// summed into.
 //
-// Each element of C is produced by exactly one thread, summing its KC blocks in
-// order, so the result is the same whatever size the team is - the property
-// the scalar loops were threaded to keep. It is not the same as the scalar
-// loops' result, though: the vector path fuses each multiply-add and every
-// path sums in blocks, so the two agree to float rounding rather than bit for
-// bit. gpt_bench.h measures by how much.
+// Each element of C is computed by exactly one thread, which adds up its KC
+// blocks in order. So the result is the same for any number of threads. The
+// threaded scalar loops were written to have the same property. The result is
+// not identical to the scalar loops' result, though. The vector path fuses
+// each multiply and add, and every path sums in blocks, so the two results
+// agree to float rounding, not bit for bit. gpt_bench.h measures how large the
+// difference is.
 
 #pragma once
 
@@ -46,9 +48,9 @@
 #include <cstddef>
 #include <vector>
 
-// The vector path wants FMA as well as AVX2. MSVC has no macro for FMA, but
-// /arch:AVX2 promises it; gcc and clang define __FMA__ under -mfma or any
-// -march that has it, -march=native on the i9 included.
+// The vector path needs FMA as well as AVX2. MSVC has no macro for FMA, but
+// /arch:AVX2 guarantees it. gcc and clang define __FMA__ under -mfma, or under
+// any -march that includes FMA, such as -march=native on the i9.
 #if defined(__AVX2__) && (defined(__FMA__) || defined(_MSC_VER))
 #define GPT_GEMM_AVX2 1
 #include <immintrin.h>
@@ -69,10 +71,11 @@ namespace blocked {
 constexpr int kMR = 6;
 constexpr int kNR = 16;
 
-// The cache blocks, from the inside out. A KC x NR sliver of B is 16KB, half
-// of the i9's 32KB L1, which leaves room for the A panel streaming past it. An
-// MC x KC block of A is 120KB, small enough that the two hyperthreads sharing
-// a core's 256KB L2 both fit. KC x NC of packed B is 3MB, a fifth of the L3.
+// The cache blocks, from the innermost out. A KC x NR sliver of B is 16KB,
+// half of the i9's 32KB L1 cache, which leaves room for the A panel that is
+// read alongside it. An MC x KC block of A is 120KB. That is small enough for
+// the blocks of both hyperthreads of a core to fit in the core's 256KB L2
+// cache. The packed KC x NC slab of B is 3MB, a fifth of the L3 cache.
 constexpr int kMC = 120;
 constexpr int kKC = 256;
 constexpr int kNC = 3072;
@@ -80,9 +83,9 @@ constexpr int kNC = 3072;
 static_assert(kMC % kMR == 0, "an A block has to be a whole number of panels");
 static_assert(kNC % kNR == 0, "a B slab has to be a whole number of slivers");
 
-// Below this many multiply-adds a multiply stays on the calling thread. Handing
-// out work costs a few microseconds, which is about what a quarter of a million
-// multiply-adds take on one core.
+// A multiply with fewer multiply-adds than this stays on the calling thread.
+// Distributing work to threads costs a few microseconds, which is about the
+// time one core needs for a quarter of a million multiply-adds.
 constexpr double kMinThreadedMacs = 262144.0;
 
 inline bool in_parallel() {
@@ -121,10 +124,11 @@ inline int round_up(int v, int to) {
     return (v + to - 1) / to * to;
 }
 
-// op(A) is m x k. Copies rows [i0, i0 + mc) and columns [p0, p0 + kc) of it
-// into panels of kMR rows, each stored column by column, so that the tile
-// reads kMR consecutive values for every step along k. Rows past the end are
-// zeros, which is what lets the tile always compute a full 6 x 16.
+// op(A) is m x k. Copies rows [i0, i0 + mc) and columns [p0, p0 + kc) of op(A)
+// into panels of kMR rows. Each panel is stored column by column, so that the
+// tile reads kMR consecutive values for every step along k. Rows past the end
+// of A are filled with zeros, so the tile can always compute a full 6 x 16
+// block.
 template <class T>
 void pack_a(const T* a, int lda, bool trans, int i0, int mc, int p0, int kc,
     T* out) {
@@ -132,8 +136,9 @@ void pack_a(const T* a, int lda, bool trans, int i0, int mc, int p0, int kc,
         T* panel = out + static_cast<size_t>(ir) * kc;
         const int rows = std::min(kMR, mc - ir);
         if (trans) {
-            // op(A)(i, p) = A[p][i], so one step along k is one stored row,
-            // and the panel's kMR values for it sit side by side.
+            // op(A)(i, p) = A[p][i], so one step along k is one stored row of
+            // A, and the panel's kMR values for that step are next to each
+            // other in that row.
             for (int p = 0; p < kc; ++p) {
                 const T* src = a + static_cast<size_t>(p0 + p) * lda + i0 + ir;
                 T* dst = panel + static_cast<size_t>(p) * kMR;
@@ -163,13 +168,15 @@ void pack_a(const T* a, int lda, bool trans, int i0, int mc, int p0, int kc,
     }
 }
 
-// op(B) is k x n. Copies rows [p0, p0 + kc) and columns [j0, j0 + cols) of it
-// into one sliver of kNR columns stored row by row, zero past the last column.
+// op(B) is k x n. Copies rows [p0, p0 + kc) and columns [j0, j0 + cols) of
+// op(B) into one sliver of kNR columns, stored row by row. Columns past the
+// end are filled with zeros.
 template <class T>
 void pack_b(const T* b, int ldb, bool trans, int p0, int kc, int j0, int cols,
     T* out) {
     if (trans) {
-        // op(B)(p, j) = B[j][p]: each column of the sliver is a stored row.
+        // op(B)(p, j) = B[j][p], so each column of the sliver is a stored
+        // row of B.
         for (int c = 0; c < kNR; ++c) {
             if (c < cols) {
                 const T* src = b + static_cast<size_t>(j0 + c) * ldb + p0;
@@ -198,11 +205,11 @@ void pack_b(const T* b, int ldb, bool trans, int p0, int kc, int j0, int cols,
     }
 }
 
-// C (kMR x kNR, row stride ldc) += alpha * the product of one packed A panel
-// and one packed B sliver, kc deep. Written so that a compiler can vectorise
-// the inner loop by itself: the accumulator is a local array, which nothing
-// else can alias, and its row is exactly kNR wide. This is what a double build
-// runs, and what any machine without AVX2 runs.
+// C (kMR x kNR, row stride ldc) += alpha * (one packed A panel) * (one packed
+// B sliver), kc deep. It is written so that a compiler can vectorise the inner
+// loop by itself: the accumulator is a local array, so no pointer can alias
+// it, and its rows are exactly kNR wide. A double build runs this version, and
+// so does any machine without AVX2.
 template <class T>
 inline void micro_tile_portable(int kc, const T* a, const T* b, T alpha, T* c,
     int ldc) {
@@ -231,12 +238,12 @@ inline void store_row_avx2(float* row, __m256 lo, __m256 hi, __m256 alpha) {
     _mm256_storeu_ps(row + 8, _mm256_fmadd_ps(alpha, hi, _mm256_loadu_ps(row + 8)));
 }
 
-// The same tile with the twelve accumulators named one by one, so that they
-// live in registers for the whole of the k loop instead of wherever the
-// compiler would have put an array. Each step along k is two loads of B, six
-// broadcasts of A and twelve fused multiply-adds - 192 flops for 8 loads.
-// The loads are unaligned because std::vector promises 16 bytes, not 32; on
-// anything since Haswell an unaligned load of aligned data costs nothing extra.
+// The same tile, with the twelve accumulators as twelve named variables. This
+// keeps them in registers for the whole k loop; the compiler might put an
+// array in memory instead. Each step along k is two loads of B, six broadcasts
+// of A and twelve fused multiply-adds: 192 flops for 8 loads. The loads are
+// unaligned because std::vector guarantees 16-byte alignment, not 32. On every
+// CPU since Haswell, an unaligned load of aligned data costs nothing extra.
 inline void micro_tile_avx2(int kc, const float* a, const float* b, float alpha,
     float* c, int ldc) {
     __m256 c00 = _mm256_setzero_ps();
@@ -299,9 +306,9 @@ inline const char* kernel_name() {
 }
 
 #if GPT_GEMM_AVX2
-// micro_tile is a plain overload, so float picks it by ordinary overload
-// resolution and every other type falls through to the template. kernel_name
-// has no arguments to overload on, so it is specialised instead.
+// micro_tile is a plain overload, so normal overload resolution picks it for
+// float, and every other type uses the template. kernel_name has no arguments
+// to overload on, so it is specialised instead.
 inline void micro_tile(int kc, const float* a, const float* b, float alpha,
     float* c, int ldc) {
     micro_tile_avx2(kc, a, b, alpha, c, ldc);
@@ -313,10 +320,10 @@ inline const char* kernel_name<float>() {
 }
 #endif
 
-// One MC-row block of A against one NR-column sliver of B: a column of tiles.
-// A tile hanging off the bottom or right edge of C is computed in full into a
-// scratch tile and only its valid part added in, so the tile itself never has
-// to know about edges.
+// Multiplies one MC-row block of A by one NR-column sliver of B, which gives
+// one column of tiles. A tile that extends past the bottom or right edge of C
+// is computed in full into a scratch tile, and only its valid part is added to
+// C. So the tile code never has to handle edges.
 template <class T>
 void compute_strip(const T* apack, int mc, const T* bsliver, int cols, int kc,
     T alpha, T* c, int ldc) {
@@ -338,11 +345,11 @@ void compute_strip(const T* apack, int mc, const T* bsliver, int cols, int kc,
     }
 }
 
-// The packing buffers belong to the thread using them, and grow to the largest
-// multiply that thread has seen. Packed B is shared with the rest of the team
-// for the length of one call, which is safe because the calling thread's
-// buffer is the one handed out and it does not start another multiply until
-// this one has returned.
+// Each thread has its own packing buffers, which grow to fit the largest
+// multiply that thread has done. During one call, the packed B is shared with
+// the rest of the team. This is safe because the shared buffer belongs to the
+// calling thread, and that thread does not start another multiply until this
+// one has returned.
 template <class T>
 std::vector<T>& packed_a() {
     thread_local std::vector<T> buf;
@@ -356,14 +363,14 @@ std::vector<T>& packed_b() {
 }
 
 // C (m x n) += alpha * op(A) * op(B), where op(A) is m x k and op(B) is k x n.
-// lda, ldb and ldc are the row strides of the matrices as they are stored, so
-// a transposed operand's stride is the one of its untransposed shape. A stride
-// wider than the row is fine, which is how attention hands in one head's
-// slice of every row.
+// lda, ldb and ldc are the row strides of the matrices as they are stored. So
+// the stride of a transposed operand is the stride of its untransposed shape.
+// A stride wider than the row is allowed; attention uses this to pass one
+// head's slice of every row.
 //
-// may_thread says whether this is a place a team can be started. Attention
-// calls this once per (batch, head) from inside a loop that is already split
-// across threads, and those calls have to stay on the thread that made them.
+// may_thread says whether this call may start a team of threads. Attention
+// calls this once per (batch, head) from inside a loop that is already divided
+// across threads. Those calls have to stay on the thread that made them.
 template <class T>
 void gemm(bool trans_a, bool trans_b, int m, int n, int k, T alpha,
     const T* a, int lda, const T* b, int ldb, T* c, int ldc, bool may_thread) {
@@ -410,12 +417,13 @@ void gemm(bool trans_a, bool trans_b, int m, int n, int k, T alpha,
         return;
     }
 
-    // The team shares one packed slab of B and splits the work under it as
-    // (A block, B sliver) pairs. Pairs rather than A blocks alone, because a
-    // weight gradient has only fan_in rows - four blocks at the video's final
-    // width - and sixteen threads need more pieces than that. Each thread takes
-    // a contiguous run of pairs, so it mostly stays on one A block and packs it
-    // once; a block that straddles two threads' runs is packed by both.
+    // The team shares one packed slab of B and divides the work on it into
+    // (A block, B sliver) pairs. The work is divided into pairs, not only into
+    // A blocks, because a weight gradient has only fan_in rows. At the video's
+    // final width that is four blocks, and sixteen threads need more pieces
+    // than that. Each thread takes a contiguous range of pairs, so it mostly
+    // works on one A block and packs it once. If a block is in the ranges of
+    // two threads, both of them pack it.
     const int m_blocks = (m + kMC - 1) / kMC;
 #pragma omp parallel
     {
@@ -456,8 +464,8 @@ void gemm(bool trans_a, bool trans_b, int m, int n, int k, T alpha,
                         std::min(kNR, nc - jr), kc, alpha,
                         c + static_cast<size_t>(ic) * ldc + jc + jr, ldc);
                 }
-                // Nobody repacks B for the next slab until everyone is done
-                // reading this one.
+                // No thread packs B for the next slab until every thread has
+                // finished reading this one.
 #pragma omp barrier
             }
         }

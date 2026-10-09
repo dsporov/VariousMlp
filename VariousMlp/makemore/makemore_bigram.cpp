@@ -5,14 +5,14 @@
 // The video builds the same bigram character-level language model twice:
 //   1. count every bigram in the training set, then normalise the rows
 //   2. fit a 27x27 weight matrix by gradient descent on the same bigrams
-// Both land on a loss of ~2.454 nats, which is the whole point: the neural net
-// is not learning something cleverer than counting, it is *rediscovering* the
-// counts. Getting the two numbers to agree is the payoff.
+// Both reach a loss of ~2.454 nats, and that is the whole point: the neural
+// net does not learn anything cleverer than counting; it *finds the counts
+// again*. The goal of the file is to make the two numbers agree.
 //
 // Needs names.txt (32033 names, one per line) next to this file.
 //
 // Part 4 does full-batch gradient descent over all 228146 bigrams, 100 steps:
-// ~6s in Release, ~24s in Debug. Prefer Release if you are iterating.
+// ~6s in Release, ~24s in Debug. Use Release if you run it often.
 //
 
 #include <algorithm>
@@ -37,11 +37,12 @@ namespace {
 
 constexpr int kVocab = 27;   // '.' plus the 26 lowercase letters
 
-// The video's stoi / itos dicts. A contiguous alphabet means we can just do
-// arithmetic instead of building the maps.
-// Anything outside '.' and a-z lands outside [0, kVocab) and indexes off the
-// end of the 27x27 arrays, so it is worth a compare per character. load_names
-// filters the dataset up front; this is the backstop for hand-written probes.
+// The video's stoi / itos dicts. Because the alphabet is contiguous, simple
+// arithmetic replaces the maps.
+// Any character other than '.' and a-z would give an index outside
+// [0, kVocab) and read past the end of the 27x27 arrays, so one comparison per
+// character is worth it. load_names filters the dataset in advance; this
+// check catches the remaining cases, such as hand-written test strings.
 //
 // Python:
 //   chars = sorted(list(set(''.join(words))))
@@ -62,11 +63,12 @@ inline char decode(int i) {
 
 // Python: words = open('names.txt', 'r').read().splitlines()
 std::vector<std::string> load_names() {
-    // Relative to a few plausible working directories: Visual Studio runs with
-    // cwd = $(ProjectDir), a bare exe run has cwd = x64\Debug, and running from
-    // the repo root is the other common case. A CMake build runs from somewhere
-    // in its build tree, which none of those reach, so it names the directory
-    // outright and that goes first.
+    // The data is searched for relative to a few likely working directories.
+    // Visual Studio runs with cwd = $(ProjectDir), a run of the exe on its own
+    // has cwd = x64\Debug, and running from the repo root is the other common
+    // case. A CMake build runs from somewhere in its build tree, which none of
+    // these paths reach. So CMake defines the directory explicitly, and it is
+    // tried first.
     static const char* kCandidates[] = {
 #ifdef VARIOUSMLP_DATA_DIR
         VARIOUSMLP_DATA_DIR "/names.txt",
@@ -88,9 +90,10 @@ std::vector<std::string> load_names() {
             if (line.empty()) continue;
             if (line.back() == '\r')
                 line.pop_back();  // CRLF
-            // The model has exactly 27 tokens, so a stray uppercase letter,
-            // digit or accent has nowhere to go. Drop those lines here rather
-            // than letting encode() abort the whole run over one bad name.
+            // The model has exactly 27 tokens, so an unexpected uppercase
+            // letter, digit or accented letter has no token. Such lines are
+            // dropped here, so that encode() does not stop the whole run
+            // because of one bad name.
             const bool clean = std::all_of(line.begin(), line.end(),
                 [](char c) { return c >= 'a' && c <= 'z'; });
             if (clean)
@@ -113,8 +116,8 @@ std::vector<std::string> load_names() {
 //       ix1 = stoi[ch1]
 //       ix2 = stoi[ch2]
 //
-// Walking with a 'prev' index is the same traversal without materialising the
-// padded list on every word.
+// Going through the word with a 'prev' index gives the same pairs, without
+// building the padded list for every word.
 template <class F>
 void for_each_bigram(const std::string& w, F&& f) {
     int prev = 0;                                  // leading '.'
@@ -166,7 +169,7 @@ void print_top_bigrams(const std::vector<int>& N, int k) {
     }
 }
 
-// The ASCII stand-in for the video's plt.imshow of the count matrix.
+// A text version of the video's plt.imshow of the count matrix.
 //
 // Python:
 //   plt.figure(figsize=(16, 16))
@@ -188,9 +191,10 @@ void print_count_matrix(const std::vector<int>& N) {
     }
 }
 
-// The postcondition for anything claiming to produce a distribution. 27x27
-// adds, run once per matrix, and it is the check that catches a normalisation
-// written the wrong way round - which otherwise just looks like a bad model.
+// The postcondition for any function that produces a probability
+// distribution. It costs 27x27 additions, once per matrix. It catches a
+// normalisation along the wrong axis, which otherwise only looks like a bad
+// model.
 void check_rows_sum_to_one(const std::vector<double>& P, const char* what) {
     CHECK(P.size() == kVocab * kVocab, what << ": expected a " << kVocab << "x"
         << kVocab << " matrix, got " << P.size() << " entries");
@@ -203,8 +207,9 @@ void check_rows_sum_to_one(const std::vector<double>& P, const char* what) {
     }
 }
 
-// P = (N + smoothing) normalised per row. smoothing=0 is the raw model,
-// smoothing=1 is the video's "model smoothing" that kills the infinities.
+// P = (N + smoothing), normalised per row. smoothing=0 is the raw model.
+// smoothing=1 is the video's "model smoothing", which removes the infinite
+// losses.
 //
 // Python:
 //   P = (N + 1).float()
@@ -221,8 +226,8 @@ std::vector<double> row_normalise(const std::vector<int>& N, double smoothing) {
             sum += N[i * kVocab + j] + smoothing;
         }
         
-        // A character that never starts a bigram leaves an all-zero row, and
-        // 0/0 would quietly fill it with NaN.
+        // A character that never starts a bigram has a row of zeros, and 0/0
+        // would silently fill that row with NaN.
         CHECK(sum > 0.0, "no counts in the row for '" << decode(i)
             << "'; pass smoothing > 0 to make it a valid distribution");
         for (int j = 0; j < kVocab; ++j) {
@@ -238,8 +243,8 @@ std::vector<double> row_normalise(const std::vector<int>& N, double smoothing) {
 // 2. Sampling
 // ---------------------------------------------------------------------------
 
-// torch.multinomial on one row. discrete_distribution normalises internally,
-// so the row's weights can be counts or probabilities.
+// torch.multinomial on one row. discrete_distribution normalises by itself, so
+// the row can contain counts or probabilities.
 //
 // Python:
 //   out = []
@@ -254,9 +259,10 @@ std::string sample_name(const std::vector<double>& P, std::mt19937& g) {
     CHECK(P.size() == kVocab * kVocab, "expected a " << kVocab << "x" << kVocab
         << " probability matrix, got " << P.size() << " entries");
 
-    // A model that never emits the end token would loop forever. The uniform
-    // model in the walkthrough already produces 26-character names on average,
-    // so the cap has to be generous to only ever mean "something is broken".
+    // A model that never produces the end token would loop forever. The
+    // uniform model in the walkthrough already produces names of 26
+    // characters on average. The limit is therefore high, so that reaching it
+    // can only mean that something is broken.
     constexpr size_t kMaxLength = 1000;
 
     std::string out;
@@ -310,9 +316,9 @@ double average_nll(const std::vector<std::string>& words,
         });
     }
 
-    // Every word contributes at least one bigram, so n == 0 would mean the
-    // padding in for_each_bigram stopped working. (An unseen bigram still gives
-    // -inf here on purpose: that is the point the walkthrough makes with
+    // Every word contributes at least one bigram, so n == 0 would mean that
+    // the padding in for_each_bigram is broken. (A bigram that never occurred
+    // still gives -inf here, on purpose. The walkthrough shows this with
     // 'andrejq' before it introduces smoothing.)
     CHECK(n > 0, "scored " << words.size() << " words but counted no bigrams");
 
@@ -325,15 +331,16 @@ double average_nll(const std::vector<std::string>& words,
 // 4. The same model as a neural net
 // ---------------------------------------------------------------------------
 //
-// The network is one linear layer and nothing else, which is easy to lose in
-// the video's `W = torch.randn((27, 27))`. Naming it is what the two types
-// below are for: 27 neurons, 27 weights each, no bias, and no activation
-// function, because the softmax in softmax_cross_entropy is the only
-// nonlinearity in the model. That makes this multinomial logistic regression -
-// the hidden layer, and with it the name MLP, only arrives in the next video.
+// The network is one linear layer and nothing else. That is easy to miss in
+// the video's `W = torch.randn((27, 27))`. The two types below make it
+// explicit: 27 neurons with 27 weights each, no bias, and no activation
+// function. The softmax in softmax_cross_entropy is the only nonlinearity in
+// the model. So this is multinomial logistic regression. The hidden layer,
+// and with it the name MLP, only comes in the next video.
 
-// Softmax over one row of kVocab logits. Subtracting the row max first costs
-// nothing and keeps exp() away from overflow; softmax is invariant to it.
+// Softmax over one row of kVocab logits. Subtracting the row maximum first
+// costs almost nothing and prevents overflow in exp(). It does not change the
+// result.
 //
 // Python:
 //   counts = logits.exp()
@@ -350,9 +357,9 @@ void softmax(const double* logits, double* probs) {
     }
 }
 
-// A single neuron: kInputs weights and no bias. It is a view onto the layer
-// rather than an owner of its own weights, because LinearLayer stores all 27
-// neurons interleaved and a neuron's weights are therefore a strided column.
+// A single neuron: kInputs weights and no bias. It is a view into the layer
+// and does not own its weights. LinearLayer stores the weights of all 27
+// neurons interleaved, so one neuron's weights form a strided column.
 class Neuron {
 public:
     static constexpr int kInputs = kVocab;
@@ -362,10 +369,11 @@ public:
     {
     }
 
-    // The weight this neuron puts on `input`. It is also the neuron's output
-    // for that input: the dot product collapses when the input is one-hot,
-    // since every term but one is multiplied by zero. That is why exp(W) ends
-    // up resembling the count matrix - each weight is a log count in disguise.
+    // The weight this neuron gives to `input`. It is also the neuron's output
+    // for that input: with a one-hot input, the dot product reduces to one
+    // term, because every other term is multiplied by zero. That is why
+    // exp(W) ends up similar to the count matrix: each weight is really a log
+    // count.
     double weight(int input) const {
         CHECK(input >= 0 && input < kInputs,
             "input " << input << " is outside [0, " << kInputs << ")");
@@ -377,15 +385,16 @@ private:
     int stride_;
 };
 
-// The whole network: one layer, kNeurons wide, holding the weights and their
-// gradients side by side the way micrograd's Value holds .data and .grad.
+// The whole network: one layer, kNeurons wide. It holds the weights and their
+// gradients next to each other, in the same way as micrograd's Value holds
+// .data and .grad.
 //
-// Storage is input-major - w_[input * kNeurons + neuron] - which is the
-// transpose of "each neuron owns a contiguous array". That is deliberate: a
-// one-hot input needs all 27 neurons' weights for one character, and this
-// layout makes that a single contiguous row. The video makes the same point
-// from the other side, that one_hot(x) @ W is an expensive way to spell an
-// array index.
+// The storage is input-major, w_[input * kNeurons + neuron], which is the
+// transpose of "each neuron owns a contiguous array". That is on purpose. A
+// one-hot input needs the weights of all 27 neurons for one character, and
+// with this layout they form one contiguous row. The video makes the same
+// point from the other direction: one_hot(x) @ W is an expensive way to write
+// an array index.
 class LinearLayer {
 public:
     static constexpr int kNeurons = kVocab;
@@ -407,9 +416,9 @@ public:
         return Neuron(&w_[j], kNeurons);
     }
 
-    // The logits for a one-hot input, one per neuron. Unchecked on purpose:
-    // this is the inner loop, and validate_examples has already established
-    // that every x and y in the training set indexes a real row.
+    // The logits for a one-hot input, one per neuron. There is no check here,
+    // on purpose: this is the inner loop, and validate_examples has already
+    // confirmed that every x and y in the training set is a valid row index.
     //
     // Python:
     //   xenc = F.one_hot(xs, num_classes=27).float()
@@ -418,7 +427,7 @@ public:
         return &w_[input * kNeurons];
     }
 
-    // Where the backward pass accumulates d(loss)/d(logits) for that same row.
+    // Where the backward pass adds up d(loss)/d(logits) for that same row.
     double* dlogits(int input) {
         return &dw_[input * kNeurons];
     }
@@ -427,11 +436,12 @@ public:
         std::fill(dw_.begin(), dw_.end(), 0.0);
     }
 
-    // The video's 0.01 * (W**2).mean(): gravity pulling every weight toward
-    // zero, which is what add-one smoothing on the counts looks like from the
-    // gradient-descent side. Split in two so the reported number and the
-    // gradient stay independently readable; both loops are over 27x27 weights,
-    // which is nothing next to the pass over the examples.
+    // The video's 0.01 * (W**2).mean(): a force that pulls every weight
+    // toward zero. In gradient descent, this has the same effect as add-one
+    // smoothing of the counts. It is split into two functions, so that the
+    // reported number and the gradient can be read separately. Both loops are
+    // over 27x27 weights, which costs almost nothing compared with the pass
+    // over the examples.
     double l2_penalty(double reg) const {
         double sq = 0.0;
         for (int k = 0; k < kParameters; ++k) {
@@ -454,8 +464,8 @@ public:
         }
     }
 
-    // The trained layer as a 27x27 probability matrix, which lets the count
-    // model's scoring and sampling code run unchanged on the neural net.
+    // The trained layer as a 27x27 probability matrix. With it, the count
+    // model's scoring and sampling code can run unchanged on the neural net.
     std::vector<double> probabilities() const {
         std::vector<double> P(kParameters);
         for (int i = 0; i < kInputs; ++i) {
@@ -469,13 +479,14 @@ private:
     std::vector<double> dw_;
 };
 
-// Softmax and negative log likelihood for one example, fused. Returns the loss
-// and accumulates scale * d(loss)/d(logits) into `dlogits`.
+// Softmax and negative log likelihood for one example, in one function.
+// Returns the loss, and adds scale * d(loss)/d(logits) into `dlogits`.
 //
-// The pair collapses to one line: for softmax followed by NLL the gradient is
-// probs - onehot(target). That is what loss.backward() derives in the video,
-// and writing it by hand is what keeps this file independent of the micrograd
-// engine - 228k examples x 27 classes would be ~14M Value nodes per step.
+// For softmax followed by NLL, the gradient reduces to one line:
+// probs - onehot(target). That is what loss.backward() computes in the video.
+// Writing it by hand keeps this file independent of the micrograd engine.
+// With micrograd, 228k examples x 27 classes would be ~14M Value nodes per
+// step.
 //
 // Python: loss = -probs[torch.arange(num), ys].log().mean()
 double softmax_cross_entropy(const double* logits, int target, double scale,
@@ -488,10 +499,10 @@ double softmax_cross_entropy(const double* logits, int target, double scale,
     return -std::log(probs[target]);
 }
 
-// One neuron's-eye view of the trained layer, because the claim that these 27
-// objects are the entire model is easier to believe when you can see one.
-// Neuron j votes for character j, so its strongest weights should be the
-// characters that most often precede it.
+// Shows the trained layer from the point of view of one neuron. The claim that
+// these 27 objects are the whole model is easier to believe when you can see
+// one of them. Neuron j votes for character j, so its strongest weights should
+// belong to the characters that most often come before character j.
 void print_neuron(const LinearLayer& layer, int j, int top_k) {
     CHECK(top_k > 0 && top_k <= Neuron::kInputs,
         "asked for the top " << top_k << " of " << Neuron::kInputs << " weights");
@@ -512,9 +523,10 @@ void print_neuron(const LinearLayer& layer, int j, int top_k) {
     printf("\n");
 }
 
-// Every index here becomes raw pointer arithmetic into the layer, so a bad one
-// is an out-of-bounds write rather than a wrong answer. One pass over the
-// dataset, before training starts; the training loop itself stays check-free.
+// Every index here becomes raw pointer arithmetic into the layer, so a bad
+// index would be an out-of-bounds write, not just a wrong answer. This is one
+// pass over the dataset before training starts, so the training loop itself
+// needs no checks.
 void validate_examples(const std::vector<int>& xs, const std::vector<int>& ys) {
     CHECK(!xs.empty(), "no training examples");
     CHECK(xs.size() == ys.size(),
@@ -529,12 +541,12 @@ void validate_examples(const std::vector<int>& xs, const std::vector<int>& ys) {
 
 void train_neural_net(const std::vector<std::string>& words, double count_model_loss) {
     // The training set: one example per bigram. xs and ys hold the same
-    // characters offset by one, so a single stream of N+1 tokens could serve as
-    // both - xs reading from index 0, ys from index 1 - with the '.' between
-    // two names doing double duty as the end of one and the start of the next.
-    // That is how language models normally store their data, and it is
-    // deliberately not done here: two named arrays match the video, and the
-    // duplicate copy costs under a megabyte.
+    // characters, shifted by one. So a single stream of N+1 tokens could be
+    // used for both, with xs reading from index 0 and ys from index 1. The '.'
+    // between two names would then be both the end of one name and the start
+    // of the next. Language models usually store their data that way, but
+    // this file does not, on purpose: two named arrays match the video, and
+    // the extra copy costs less than a megabyte.
     //
     // Python:
     //   xs, ys = [], []
@@ -588,8 +600,8 @@ void train_neural_net(const std::vector<std::string>& words, double count_model_
         layer.zero_grad();
 
         // Forward and backward in the same pass: each example reads the row of
-        // logits its input character selects, and writes that row's gradient
-        // straight back.
+        // logits that its input character selects, and writes that row's
+        // gradient directly.
         double loss = 0.0;
         for (size_t i = 0; i < num; ++i) {
             const int x = xs[i];
@@ -597,7 +609,8 @@ void train_neural_net(const std::vector<std::string>& words, double count_model_
             double* dlogits = layer.dlogits(x);
             loss += softmax_cross_entropy(logits, ys[i], inv_n, dlogits);
         }
-        // L2 regularisation as a tunable knob rather than a hand-picked smoothing constant
+        // L2 regularisation, as an adjustable setting instead of a
+        // hand-picked smoothing constant
         layer.add_l2_grad(reg);
         loss = loss * inv_n + layer.l2_penalty(reg);
 
@@ -616,24 +629,25 @@ void train_neural_net(const std::vector<std::string>& words, double count_model_
     const auto secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     printf("  trained in %.2fs\n", secs);
 
-    // softmax(W) should now look like the count matrix: the net rediscovered it.
+    // softmax(W) should now look like the count matrix: the net found the
+    // counts again.
     const std::vector<double> P = layer.probabilities();
     check_rows_sum_to_one(P, "softmax of W");
     print_neuron(layer, encode('n'), 5);
 
-    // Like-for-like: both numbers below are the plain nll with no regularisation
-    // term. The net sits a little above the count model because the L2 pull is
-    // still smoothing it - drop reg to 0 and the two converge.
+    // A fair comparison: both numbers below are the plain nll, without the
+    // regularisation term. The net is a little above the count model, because
+    // the L2 term still smooths it. With reg = 0, the two numbers converge.
     long long n = 0;
     const double net_loss = average_nll(words, P, &n);
     printf("  count model loss %.6f  vs  neural net loss %.6f\n",
         count_model_loss, net_loss);
 
-    // The claim the whole file is built to demonstrate, checked instead of
-    // asserted in a comment: gradient descent rediscovered the counts. reg =
-    // 0.01 leaves the net about 0.021 nats above the count model after 100
-    // steps, so the tolerance sits just above that - raise reg, or stop
-    // training early, and this is the line that notices.
+    // The claim that this whole file demonstrates, checked in code instead of
+    // stated in a comment: gradient descent found the counts again. With
+    // reg = 0.01, the net is about 0.021 nats above the count model after 100
+    // steps, so the tolerance is just above that. If you raise reg or stop
+    // training early, this check fails.
     sanity::Expect chk;
     chk.that("training loss went down", last_loss < first_loss);
     chk.close("net matches the count model", net_loss, count_model_loss, 0.03);
@@ -676,10 +690,10 @@ void test_makemore() {
         std::cout << words[i] << " ";
     printf("\n  lengths %zu..%zu\n", shortest, longest);
 
-    // Everything below is checked against the video, which means checked
-    // against its dataset. Swap names.txt for another list and these are
-    // expected to fail - hence Expect, which reports and carries on, rather
-    // than CHECK, which would stop the walkthrough.
+    // Everything below is checked against the video, and so against the
+    // video's dataset. With a different names.txt, these checks are expected
+    // to fail. That is why they use Expect, which reports and continues, and
+    // not CHECK, which would stop the walkthrough.
     sanity::Expect data;
     data.equal("names loaded", static_cast<double>(words.size()), 32033);
     data.equal("shortest name", static_cast<double>(shortest), 2);
@@ -691,8 +705,8 @@ void test_makemore() {
     const std::vector<int> N = count_bigrams(words);
     print_top_bigrams(N, 10);
 
-    // The counting step is the foundation for both models, so pin the four
-    // counts the video reads out loud plus the total.
+    // Both models are built on the counts, so the four counts that the video
+    // mentions, and the total, are checked here.
     long long total = 0;
     for (int c : N)
         total += c;
@@ -709,8 +723,8 @@ void test_makemore() {
     std::cout << "== 2. sampling ==\n";
     std::mt19937 g(2147483647);
 
-    // For contrast, the video first samples from a uniform model to show what
-    // "untrained" looks like.
+    // For comparison, the video first samples from a uniform model, to show
+    // what an untrained model produces.
     //
     // Python: p = torch.ones(27) / 27.0
     const std::vector<double> uniform(kVocab * kVocab, 1.0 / kVocab);
@@ -726,9 +740,10 @@ void test_makemore() {
         "reproducible here)\n\n";
 
     std::cout << "== 3. how good is it? negative log likelihood ==\n";
-    // The last digit drifts from the video: it accumulates the log likelihood
-    // in a Python loop over float32 scalars, where 228k sequential adds onto a
-    // ~560000 running total lose a couple of units. This runs in double.
+    // The last digit differs from the video. The video adds up the log
+    // likelihood in a Python loop over float32 scalars, and 228k additions to
+    // a running total of ~560000 lose a few units of precision. This code uses
+    // double.
     long long n = 0;
     const double nll = average_nll(words, P, &n);
     printf("  %lld bigrams, average nll %.4f nats   (video: 228146 bigrams, ~2.454)\n", n, nll);
@@ -738,7 +753,7 @@ void test_makemore() {
     loss.close("average nll", nll, 2.4541, 1e-3);
     loss.report();
 
-    // A bigram the training set never saw sends the loss to infinity.
+    // A bigram that never occurs in the training set makes the loss infinite.
     const std::vector<std::string> probe = { "andrejq" };
     printf("  nll of 'andrejq' unsmoothed: %.4f  ('jq' was never seen)\n",
         average_nll(probe, P, nullptr));

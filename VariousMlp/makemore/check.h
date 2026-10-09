@@ -1,26 +1,29 @@
 // check.h - the sanity checks shared by the Karpathy ports.
 //
-// Two flavours, because the mistakes come in two flavours:
+// There are two kinds of check, because there are two kinds of mistake:
 //
 //   CHECK(cond, msg)  a hard check on structure: mismatched array lengths, an
-//                     index outside the vocabulary, a division by zero. Throws,
-//                     because whatever runs next is meaningless.
+//                     index outside the vocabulary, a division by zero. It
+//                     throws, because nothing that runs after it would mean
+//                     anything.
 //
-//                     Deliberately not assert(): assert compiles out under
-//                     NDEBUG, and Release is exactly where these files are meant
-//                     to be run (makemore's full-batch training is ~4x slower in
-//                     Debug). No CHECK sits inside an inner arithmetic loop, and
-//                     an interleaved A/B of makemore's 100 training steps with
-//                     and without them came out inside the run-to-run noise, so
-//                     they stay on in both configurations.
+//                     It is not assert(), on purpose: assert is removed when
+//                     NDEBUG is defined, and these files are meant to run in
+//                     Release (makemore's full-batch training is ~4x slower in
+//                     Debug). No CHECK is inside an inner arithmetic loop. An
+//                     interleaved A/B test of makemore's 100 training steps,
+//                     with and without the checks, showed no difference beyond
+//                     the normal variation between runs. So the checks stay
+//                     on in both configurations.
 //
-//   sanity::Expect    a soft check on numbers: "the video says 2.454, did we
-//                     land there?". Reports and keeps going, because a number
-//                     that drifts is information, not a broken program - and
-//                     the expected values only hold for the video's dataset.
+//   sanity::Expect    a soft check on numbers: "the video says 2.454; is our
+//                     result close to that?". It reports and continues. A
+//                     number that differs from the video is information, not
+//                     a sign of a broken program, and the expected values only
+//                     hold for the video's dataset.
 //
-// The rule of thumb for which to use: CHECK when the program is wrong, Expect
-// when the answer is.
+// A simple rule for choosing: use CHECK when the program is wrong, and Expect
+// when the result is wrong.
 
 #pragma once
 
@@ -44,8 +47,8 @@ struct CheckFailed : std::logic_error {
     throw CheckFailed(os.str());
 }
 
-// Tallies soft checks so an example can end on a single summary line; only the
-// failures print their numbers.
+// Counts soft checks, so that an example can end with a single summary line.
+// Only the failed checks print their numbers.
 class Expect {
 public:
     bool close(const char* what, double got, double want, double tol) {
@@ -80,7 +83,7 @@ private:
 
 }  // namespace sanity
 
-// The message is streamed, so it can carry the offending numbers:
+// The message is written to a stream, so it can include the wrong values:
 //   CHECK(xs.size() == ys.size(), xs.size() << " rows but " << ys.size() << " targets");
 #define CHECK(cond, msg)                                                       \
     do {                                                                       \

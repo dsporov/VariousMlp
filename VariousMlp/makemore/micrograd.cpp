@@ -39,8 +39,8 @@ struct Node {
     }
 };
 
-// Thin handle so we get Python-ish syntax. Copying a Value shares the node,
-// which is exactly the aliasing behaviour Python gives you for free.
+// A small handle class, so that the syntax looks like Python. Copying a Value
+// shares the node, which is exactly how Python objects behave by default.
 class Value {
     NodePtr n_;
 
@@ -67,14 +67,15 @@ static Value make(double data, std::vector<NodePtr> children, std::string op) {
 // --- operators -------------------------------------------------------------
 // Each closure captures the children by shared_ptr and the *output* by raw
 // pointer. Capturing the output by shared_ptr would create a reference cycle
-// (node -> closure -> node) and leak, since C++ has no GC to break it.
+// (node -> closure -> node), and the memory would leak, because C++ has no
+// garbage collector to break the cycle.
 
 Value operator+(const Value& a, const Value& b) {
     Value out = make(a.data() + b.data(), { a.node(), b.node() }, "+");
     Node* o = out.node().get();
     NodePtr x = a.node(), y = b.node();
     out.node()->backward = [o, x, y] {
-        x->grad += o->grad;   // += , not = : a node used twice accumulates
+        x->grad += o->grad;   // +=, not =, because a node may be used twice
         y->grad += o->grad;
     };
     return out;
@@ -92,9 +93,10 @@ Value operator*(const Value& a, const Value& b) {
 }
 
 Value pow(const Value& a, double k) {
-    // Both of these hand back inf/NaN silently, and one NaN poisons every
-    // gradient downstream of it. Much easier to catch at the source than to
-    // work backwards from a loss that printed "nan" 40 steps later.
+    // Both of these cases return inf or NaN without any error, and one NaN
+    // makes every gradient after it NaN as well. It is much easier to catch
+    // the problem here than to search backwards from a loss that printed "nan"
+    // 40 steps later.
     CHECK(!(a.data() == 0.0 && k < 0.0), "0 raised to " << k << " is not finite");
     CHECK(!(a.data() < 0.0 && k != std::floor(k)),
         "pow(" << a.data() << ", " << k << ") is not real: negative base, "
@@ -136,8 +138,9 @@ Value relu(const Value& a) {
     return out;
 }
 
-// Sugar. Python gets these from __neg__/__sub__/__truediv__/__radd__/__rmul__;
-// in C++ free functions cover both argument orders at once.
+// Convenience operators. Python gets these from __neg__, __sub__, __truediv__,
+// __radd__ and __rmul__. In C++, free functions handle both argument orders at
+// once.
 Value operator-(const Value& a) { return a * Value(-1.0); }
 Value operator-(const Value& a, const Value& b) { return a + (-b); }
 Value operator/(const Value& a, const Value& b) {
@@ -153,7 +156,7 @@ void Value::backward() {
     std::function<void(Node*)> build = [&](Node* v) {
         if (!visited.insert(v).second) return;
         for (const auto& c : v->prev) build(c.get());
-        topo.push_back(v);   // pushed only after all children -> topological
+        topo.push_back(v);   // added after all its children: topological order
     };
     build(n_.get());
 
@@ -215,8 +218,8 @@ struct Neuron {
     }
 
     Value operator()(const std::vector<Value>& x) const {
-        // Without this a short x reads past the end of the vector: not a wrong
-        // answer, undefined behaviour.
+        // Without this check, a short x would be read past its end. The result
+        // would not just be a wrong answer; it would be undefined behaviour.
         CHECK(x.size() == w_.size(),
             "this neuron takes " << w_.size() << " inputs, got " << x.size());
 
@@ -237,7 +240,7 @@ struct Layer {
     std::vector<Neuron> neurons_;
 
     Layer(int inputs, int outputs) {
-        // outputs = neurons count
+        // outputs = the number of neurons
         CHECK(outputs > 0, "a layer needs at least one neuron, got " << outputs);
         for (int i = 0; i < outputs; ++i)
             neurons_.emplace_back(inputs);
@@ -273,7 +276,7 @@ struct MLP {
         }
     }
 
-    // Width of the last layer, i.e. how many Values operator() hands back.
+    // The width of the last layer, i.e. how many Values operator() returns.
     size_t outputs() const { return layers_.back().neurons_.size(); }
 
     std::vector<Value> operator()(std::vector<Value> x) const {
@@ -295,8 +298,8 @@ struct MLP {
 };
 
 // ---------------------------------------------------------------------------
-// The three things the video actually walks through, plus a gradient check
-// standing in for the video's "and here is what PyTorch says"
+// The three examples that the video works through, plus a gradient check that
+// replaces the video's comparison with PyTorch
 // ---------------------------------------------------------------------------
 
 void example_manual_backprop() {
@@ -311,9 +314,9 @@ void example_manual_backprop() {
     printf("  dL/da=%.1f  dL/db=%.1f  dL/dc=%.1f  dL/df=%.1f  dL/de=%.1f\n",
         a.grad(), b.grad(), c.grad(), f.grad(), e.grad());
 
-    // The values the video derives by hand, checked rather than eyeballed.
-    // Every number here is exact in binary floating point, so the tolerance is
-    // only there to keep the comparison from being a bare ==.
+    // The values that the video derives by hand, checked by code instead of
+    // by eye. Every number here is exact in binary floating point. The
+    // tolerance is only there so that the comparison is not a bare ==.
     sanity::Expect chk;
     chk.close("L", L.data(), -8.0, 1e-12);
     chk.close("dL/da", a.grad(), 6.0, 1e-12);
@@ -335,8 +338,8 @@ void example_neuron() {
     printf("  dx1=%.4f dw1=%.4f dx2=%.4f dw2=%.4f\n",
         x1.grad(), w1.grad(), x2.grad(), w2.grad());
 
-    // b is picked in the video so that o comes out at exactly 1/sqrt(2), which
-    // makes 1 - o^2 = 1/2 and every gradient below a round number.
+    // The video chooses b so that o is exactly 1/sqrt(2). Then 1 - o^2 = 1/2,
+    // and every gradient below is a round number.
     sanity::Expect chk;
     chk.close("o", o.data(), std::sqrt(0.5), 1e-12);
     chk.close("dx1", x1.grad(), -1.5, 1e-12);
@@ -347,18 +350,18 @@ void example_neuron() {
     std::cout << "\n";
 }
 
-// The video cross-checks micrograd against PyTorch. There is no torch here, so
-// central differences play that role: for every leaf, compare the analytic
-// gradient with (f(x+h) - f(x-h)) / 2h. This is the one check that would catch
-// a wrong derivative in any of the operators above - and it is worth rerunning
-// whenever a new operator is added.
+// The video checks micrograd against PyTorch. There is no torch here, so
+// central differences do that job: for every leaf, the analytic gradient is
+// compared with (f(x+h) - f(x-h)) / 2h. This is the one check that would catch
+// a wrong derivative in any of the operators above. Run it again whenever a
+// new operator is added.
 void example_gradcheck() {
     std::cout << "== 3. gradients vs. finite differences ==\n";
 
-    // One expression touching every operator, with x0 appearing twice so the
-    // accumulating (+=) path in the backward closures is exercised too. The
-    // point chosen keeps relu off its kink, where the derivative is undefined
-    // and finite differences would disagree for a legitimate reason.
+    // One expression that uses every operator. x0 appears twice, so that the
+    // accumulating (+=) path in the backward closures is tested too. The
+    // chosen point keeps relu away from its kink. There the derivative is
+    // undefined, and finite differences would disagree for a valid reason.
     const std::vector<double> x0 = { 0.7, -1.3, 0.4, 2.0 };
 
     auto leaves = [](const std::vector<double>& xs) {
@@ -379,8 +382,8 @@ void example_gradcheck() {
     const double h = 1e-6;
     sanity::Expect chk;
     for (size_t i = 0; i < x0.size(); ++i) {
-        // Each perturbed evaluation needs a fresh graph: the nodes cache their
-        // data, so poking a leaf does not re-run the ops above it.
+        // Each changed evaluation needs a new graph. The nodes store their
+        // data, so changing a leaf does not recompute the operations above it.
         std::vector<double> hi = x0, lo = x0;
         hi[i] += h;
         lo[i] -= h;
@@ -390,8 +393,9 @@ void example_gradcheck() {
         char label[32];
         snprintf(label, sizeof label, "df/dx%zu", i);
         printf("  %s  analytic %+.8f   numeric %+.8f\n", label, analytic, numeric);
-        // Central differences carry ~1e-9 of roundoff at this h, so the
-        // tolerance is loose in absolute terms and relative for big gradients.
+        // Central differences have a rounding error of about 1e-9 at this h.
+        // So the tolerance is loose in absolute terms, and relative for large
+        // gradients.
         chk.close(label, analytic, numeric, 1e-5 * std::max(1.0, std::fabs(analytic)));
     }
     chk.report();
@@ -413,9 +417,10 @@ void example_training() {
     };
     std::vector<double> ys = { 1.0, -1.0, -1.0, 1.0 };
 
-    // The mistake these catch: adding a row to xs and forgetting its target.
-    // The loss loops over ys, so an extra input row would train on nothing and
-    // never say so, and an extra target would read past the end of ypred.
+    // The mistake these checks catch: a row added to xs without its target.
+    // The loss loops over ys. So an extra input row would silently have no
+    // effect on training, and an extra target would read past the end of
+    // ypred.
     CHECK(!xs.empty(), "no training examples");
     CHECK(xs.size() == ys.size(),
         xs.size() << " input rows in xs but " << ys.size()
@@ -440,7 +445,8 @@ void example_training() {
         for (size_t i = 0; i < ys.size(); ++i)
             loss = loss + pow(ypred[i] - Value(ys[i]), 2.0);
 
-        // backward - zero first, or gradients from the last step leak in
+        // backward: zero the gradients first, or the last step's gradients
+        // are added in
         loss.zero_grad();
         loss.backward();
 
@@ -463,13 +469,14 @@ void example_training() {
     for (double y : ys) printf("%.4f ", y);
     std::cout << "\n";
 
-    // Did the thing actually learn? Cheap to ask, and it is the check that
-    // fails first if a gradient, the sign of the update, or the learning rate
-    // is wrong - all of which still print a plausible-looking loss curve.
-    // 100 steps at lr 0.05 lands around loss 0.0066 and predictions ~0.96; the
-    // tolerances are the nearest round numbers above that, loose enough to
-    // survive a compiler's floating-point reordering and tight enough that a
-    // net which stopped learning cannot slip through.
+    // Did the network really learn? This check is cheap. It is also the first
+    // one to fail if a gradient, the sign of the update or the learning rate
+    // is wrong, because all of those still print a loss curve that looks
+    // plausible. 100 steps at lr 0.05 reach a loss of about 0.0066 and
+    // predictions of about 0.96. The tolerances are the nearest round numbers
+    // above that. They are loose enough to allow a compiler's floating-point
+    // reordering, and tight enough that a network which stopped learning
+    // fails.
     sanity::Expect chk;
     chk.that("loss went down", last_loss < first_loss);
     chk.close("final loss", last_loss, 0.0, 0.02);
@@ -485,7 +492,7 @@ void test_micrograd() {
     example_gradcheck();
     example_training();
 
-    // dump a small graph for graphviz:  ./micrograd > out && dot -Tsvg ...
+    // print a small graph for graphviz:  ./micrograd > out && dot -Tsvg ...
     Value a(2.0), b(-3.0), c(10.0);
     a.label("a"); b.label("b"); c.label("c");
     Value L = a * b + c;

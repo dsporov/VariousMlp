@@ -1,12 +1,12 @@
-// gpt_cuda_main.cpp - puts gpt_cuda.cu's model on the bench.
+// gpt_cuda_main.cpp - runs gpt_cuda.cu's model on the bench.
 //
-// gpt_cuda.h speaks plain floats so that nvcc never has to see gpt_model.h;
-// this file is the host code that sees both, and CudaBackend is the adapter
-// between them - the members gpt_bench.h asks of a candidate, converting
-// gpt::real to float on the way in and back on the way out. With the default
-// real = float the conversions are copies.
+// gpt_cuda.h uses plain floats, so that nvcc never has to compile gpt_model.h.
+// This file is the host code that sees both. CudaBackend is the adapter
+// between them: it provides the members that gpt_bench.h needs from a
+// candidate, and converts gpt::real to float on the way in and back on the
+// way out. With the default real = float, the conversions are plain copies.
 //
-// CMake-only, because it has its own main. Build the gpt_cuda target.
+// CMake only, because it has its own main. Build the gpt_cuda target.
 
 #include <cstdio>
 #include <exception>
@@ -70,8 +70,8 @@ private:
 }  // namespace
 
 int main() {
-    // A CHECK that fires - a CUDA call that failed included - is reported and
-    // ends the program rather than being left to terminate().
+    // A failed CHECK, including a failed CUDA call, is reported here and ends
+    // the program. Without this, it would reach terminate().
     try {
         printf("gpt_cuda: the model as CUDA kernels\n");
 

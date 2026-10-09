@@ -1,38 +1,41 @@
 // gpt_split.cpp - every batch shared between the GPU and the CPU.
 //
-// gpt_cuda.cu and the blocked multiply each train the model alone. Here they
-// train it together, by data parallelism: each step the batch's windows are
-// divided between the two, each side runs forward and backward on its share
-// with its own copy of the weights, and the two gradients become one before a
-// single AdamW step. The combination is weighted by share, because each side's
-// loss - and so its gradient - is a mean over its own windows only. With n of
-// the B windows on the GPU,
+// gpt_cuda.cu and the blocked multiply can each train the model alone. Here
+// they train it together, with data parallelism. In each step, the windows of
+// the batch are divided between the two. Each side runs the forward and
+// backward pass on its share, with its own copy of the weights. Then the two
+// gradients are combined into one, before a single AdamW step. Each side's
+// gradient is scaled by its share of the batch, because each side's loss, and
+// so its gradient, is a mean over its own windows only. With n of the B
+// windows on the GPU,
 //
 //     g = (n / B) * g_gpu + ((B - n) / B) * g_cpu
 //
-// which is the gradient of the mean over all B, the one the reference
-// computes. Section 1 of the bench checks exactly that.
+// This is the gradient of the mean over all B windows, which is what the
+// reference computes. Section 1 of the bench checks exactly that.
 //
-// The CPU's copy of the weights is the master. AdamW runs there and the result
-// goes to the GPU after every step, so there is one set of weights and one
-// optimiser state. Were each side to run its own AdamW on the same gradient,
-// the two copies would drift apart in the last bits - nvcc fuses multiply-adds
-// that the host compiler does not - and nothing would notice. The choice is
-// forced as much as chosen: gpt_cuda.h takes weights in and gives gradients
-// out and does nothing else, and this target uses it unchanged so that
-// gpt_cuda stays exactly what it was. The price is two full copies of the
-// parameters across PCIe every step, through the pageable buffers load() and
-// read_grads() allocate for themselves. The section this program adds after
-// the bench's three says what that costs.
+// The CPU's copy of the weights is the master copy. AdamW runs on the CPU, and
+// the result is copied to the GPU after every step. So there is one set of
+// weights and one optimiser state. If each side ran its own AdamW on the same
+// gradient, the two copies would slowly become different in the last bits,
+// because nvcc fuses multiply-adds that the host compiler does not fuse. And
+// nothing would detect it. There was also no other choice: gpt_cuda.h takes
+// weights in and gives gradients out, and does nothing else. This target uses
+// it unchanged, so that gpt_cuda stays exactly as it was. The cost is two full
+// copies of the parameters across PCIe in every step, through the pageable
+// buffers that load() and read_grads() allocate for themselves. The extra
+// section that this program adds after the bench's three sections shows that
+// cost.
 //
-// The split adapts. Every step times both halves, and the GPU's share moves
-// toward where the two finish together. It starts from the throughputs
-// measured at the bench's width: 504 GFLOP/s on the GTX 1050 Ti against 319
-// blocked on the i9, about 0.6 of the windows to the GPU. At the walkthrough's
-// 32 channels expect nothing from it - the GPU is launch-bound there and
-// already slower than the blocked multiply on its own.
+// The GPU's share adapts. Every step times both halves, and the GPU's share
+// moves toward the point where both halves finish at the same time. It starts
+// from the speeds measured at the bench's width: 504 GFLOP/s on the
+// GTX 1050 Ti and 319 GFLOP/s for the blocked multiply on the i9. So about 0.6
+// of the windows go to the GPU. At the walkthrough's 32 channels, expect no
+// gain: there the GPU is limited by the cost of kernel launches, and it is
+// already slower than the blocked multiply alone.
 //
-// CMake-only, because it has its own main. Build the gpt_split target.
+// CMake only, because it has its own main. Build the gpt_split target.
 
 #include <algorithm>
 #include <cmath>
@@ -60,24 +63,24 @@ using bench::seconds_since;
 
 namespace {
 
-// The GPU's share of each batch before anything has been timed:
+// The GPU's share of each batch before any step has been timed:
 // 504 / (504 + 319), rounded.
 constexpr double kInitialGpuShare = 0.6;
 
-// How far one step's timing moves the running estimates. Low enough that one
-// slow step - a burst of page faults, the OS scheduling something else - does
-// not swing the split, high enough to settle within the few dozen steps
-// section 3 times.
+// How much one step's timing changes the running averages. It is low enough
+// that one slow step (for example many page faults at once, or the OS running
+// something else) does not move the share much. It is high enough that the
+// share settles within the few dozen steps that section 3 times.
 constexpr double kSmoothing = 0.25;
 
-// The thread that drives the GPU is busy for the whole of its half: waiting on
-// copies, which the CUDA runtime does by default by spinning, and then
-// unpacking the gradients. The CPU half gives up a thread to it rather than
-// oversubscribing the cores, which an OpenMP team, waiting at every barrier
-// for its slowest member, takes badly.
+// The thread that drives the GPU is busy for the whole GPU half. It waits for
+// copies, which the CUDA runtime does by spinning by default, and then it
+// unpacks the gradients. So the CPU half uses one thread fewer, and the cores
+// are not oversubscribed. Oversubscription slows an OpenMP team down a lot,
+// because the team waits at every barrier for its slowest thread.
 constexpr int kGpuDriverThreads = 1;
 
-// A running average that takes its first sample as it is.
+// A running average. The first sample is used as it is.
 class Smoothed {
 public:
     void add(double sample) {
@@ -92,9 +95,9 @@ private:
     bool seen_ = false;
 };
 
-// Sets the OpenMP team size for this thread's parallel regions for the length
-// of one call, and puts back what was there. The bench runs the reference on
-// this same thread, and it should keep every core.
+// Sets the OpenMP team size for this thread's parallel regions during one
+// call, and restores the previous size afterwards. The bench runs the
+// reference on this same thread, and the reference should keep all cores.
 class ThreadLimit {
 public:
     explicit ThreadLimit(int n) : saved_(available_threads()) { set(n); }
@@ -114,9 +117,10 @@ private:
     int saved_;
 };
 
-// Where the most recent backend's steps went, smoothed. The bench owns the
-// backends and destroys each at the end of its section, so they leave this
-// behind for main to print once section 3 is over.
+// Where the time of the most recent backend's steps went, as running averages.
+// The bench owns the backends and destroys each one at the end of its section.
+// So each backend writes its numbers here, and main prints them after
+// section 3.
 struct SplitLog {
     int gpu_rows = 0;
     int cpu_rows = 0;
@@ -136,7 +140,7 @@ public:
           cpu_threads_(std::max(1, available_threads() - kGpuDriverThreads)),
           log_(log)
     {
-        // combine() walks the two sets of gradients side by side, so they
+        // combine() goes through the two sets of gradients together, so they
         // have to be the same tensors in the same order.
         const std::vector<size_t>& sizes = gpu_.tensor_sizes();
         const std::vector<Param>& params = cpu_.model().params();
@@ -157,7 +161,8 @@ public:
         upload_weights();
     }
 
-    // After forward_backward the CPU model's gradients are the combined ones.
+    // After forward_backward, the CPU model's gradients are the combined
+    // gradients.
     void read_grads(std::vector<std::vector<real>>& out) { cpu_.read_grads(out); }
 
     void zero_grad() {
@@ -181,8 +186,9 @@ public:
         combine(n, B);
         const double combine_s = seconds_since(start);
 
-        // The first step pays for allocation and first touch on both sides,
-        // and would skew the split if it counted.
+        // The first step includes one-time costs on both sides: allocation,
+        // and the first touch of new memory. Counting it would distort the
+        // share.
         if (steps_ > 1 && n > 0 && n < B) {
             gpu_row_s_.add(gpu.seconds / n);
             cpu_row_s_.add(cpu.seconds / (B - n));
@@ -233,16 +239,16 @@ public:
     }
 
 private:
-    // One side's part of a pass: the mean loss over its windows, and how long
-    // it took.
+    // The result of one side's part of a pass: the mean loss over its
+    // windows, and the time it took.
     struct Half {
         real loss;
         double seconds;
     };
 
-    // Both sides get at least one window whenever there are two to go round,
-    // so that both are always being timed and the split can keep moving. A
-    // single window cannot be split, and goes to the GPU.
+    // If there are at least two windows, each side gets at least one. Then
+    // both sides are always timed, and the share can keep adjusting. A single
+    // window cannot be divided, so it goes to the GPU.
     int gpu_rows(int B) const {
         if (B < 2) {
             return B;
@@ -251,8 +257,9 @@ private:
         return std::clamp(n, 1, B - 1);
     }
 
-    // The first n windows on the GPU, driven from a thread of its own, and the
-    // rest on this one, at the same time. A side with no windows is skipped.
+    // Runs the first n windows on the GPU, driven from a separate thread, and
+    // the rest on this thread, at the same time. A side with no windows is
+    // skipped.
     std::pair<Half, Half> both_halves(const int* x, const int* y, int n, int B,
         int T, bool backward) {
         std::future<Half> gpu_half;
@@ -272,9 +279,9 @@ private:
             });
         }
 
-        // Should this half throw, gpu_half's destructor waits for the GPU's
-        // before the exception leaves, so the thread never outlives the
-        // buffers it writes.
+        // If this half throws, the destructor of gpu_half waits for the GPU
+        // half to finish before the exception leaves this function. So the
+        // thread never outlives the buffers it writes to.
         Half cpu{ real(0), 0.0 };
         if (n < B) {
             const size_t skip = static_cast<size_t>(n) * static_cast<size_t>(T);
@@ -290,17 +297,19 @@ private:
         return { gpu, cpu };
     }
 
-    // Each side's mean, weighted by how many windows it saw. In double, since
-    // the bench holds this to 1e-4 of the reference's.
+    // The mean loss over the whole batch: each side's mean loss counts in
+    // proportion to its number of windows. It is computed in double, because
+    // the bench requires it to match the reference to 1e-4.
     static real mean_loss(real gpu, real cpu, int n, int B) {
         const double sum = static_cast<double>(n) * static_cast<double>(gpu)
             + static_cast<double>(B - n) * static_cast<double>(cpu);
         return static_cast<real>(sum / static_cast<double>(B));
     }
 
-    // Turns the CPU model's gradients, a mean over its own windows, into the
-    // mean over the whole batch. With no windows on the GPU they already are.
-    // Split by tensor, like AdamW, for one fork a step.
+    // Turns the CPU model's gradients, which are a mean over its own windows,
+    // into the mean over the whole batch. With no windows on the GPU, they
+    // already are that mean. The work is divided by tensor, as in AdamW, so
+    // there is only one OpenMP fork per step.
     void combine(int n, int B) {
         if (n == 0) {
             return;
@@ -349,13 +358,14 @@ private:
     int steps_ = 0;
     bool zeroed_ = false;
 
-    // Kept between steps so that their capacity is too.
+    // Kept between steps so that their allocated memory is reused.
     std::vector<std::vector<float>> gpu_grads_;
     std::vector<std::vector<float>> staged_;
 };
 
-// A step is its slower half plus the two serial stages after it, so this says
-// whether what is left to win is in the balance or in the exchange.
+// A step takes as long as its slower half, plus the two serial stages after
+// it. So this output shows where more speed could come from: a better balance
+// between the two halves, or a faster exchange of gradients and weights.
 void print_log(const SplitLog& log) {
     std::cout << "\n== 4. where section 3's steps went ==\n";
     printf("  Smoothed over its last few steps.\n");
@@ -375,8 +385,9 @@ void print_log(const SplitLog& log) {
 }  // namespace
 
 int main() {
-    // A CHECK that fires - a CUDA call that failed included, on either thread
-    // - is reported and ends the program rather than being left to terminate().
+    // A failed CHECK, including a failed CUDA call on either thread, is
+    // reported here and ends the program. Without this, it would reach
+    // terminate().
     try {
         printf("gpt_split: each batch shared between CUDA and the blocked multiply\n");
 
@@ -385,8 +396,8 @@ int main() {
             return 1;
         }
 
-        // The CPU side's own initial weights are thrown away by load(), so
-        // the generator it draws them from does not matter.
+        // load() replaces the CPU side's own initial weights, so the
+        // generator that creates them does not matter.
         SplitLog log;
         const auto make = [&log](const Config& cfg, int vocab) {
             std::mt19937 unused(0);

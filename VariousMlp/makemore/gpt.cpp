@@ -1,18 +1,19 @@
 // gpt.cpp - a C++ port of Andrej Karpathy's "Let's build GPT: from scratch, in
 // code, spelled out" (video 7 of Neural Networks: Zero to Hero)
 //
-// The makemore files all answer the same question - how do you use more than
-// one character of context - and all answer it the same way: staple the context
-// together and push it through a fixed-width layer. That runs out of room fast.
-// The bigram table needs 27^2 entries for two characters and 27^4 for four; the
-// MLP fixes the parameter count but still smears the whole context into one
-// vector before the network has looked at any of it.
+// The makemore files all answer the same question, how to use more than one
+// character of context, and they all answer it in the same way: they join the
+// context together and pass it through a layer of fixed width. That stops
+// working quickly. The bigram table needs 27^2 entries for two characters and
+// 27^4 for four. The MLP keeps the parameter count small, but it still mixes
+// the whole context into one vector before the network has looked at any part
+// of it.
 //
-// A Transformer lets the tokens look at each other first. Every position emits
-// a query ("what am I looking for"), a key ("what do I have") and a value
-// ("what I will tell you if you ask"), and the strength of the edge from
-// position u to position t is the dot product of t's query with u's key. That
-// is the whole idea; the rest is bookkeeping around it.
+// A Transformer lets the tokens look at each other first. Every position
+// produces a query ("what am I looking for"), a key ("what do I contain") and
+// a value ("what I will tell you if you ask"). How strongly position t attends
+// to position u is the dot product of t's query with u's key. That is the
+// whole idea; everything else is organisation around it.
 //
 // What the video builds, in order:
 //   1. a bigram baseline on tiny Shakespeare, so there is a number to beat
@@ -20,24 +21,27 @@
 //      written first as a loop, then as a matrix multiply, then as a softmax
 //   3. one head of self-attention
 //   4. several heads in parallel, plus a per-position feedforward layer
-//   5. residual connections, layer normalisation and dropout, which are what
-//      let the thing be stacked
+//   5. residual connections, layer normalisation and dropout, which make it
+//      possible to stack many blocks
 //
-// The model those five steps arrive at lives in gpt_model.h, because
+// The model that these five steps produce is in gpt_model.h, because
 // gpt_chat.cpp needs it too. This file is the walkthrough around it.
 //
 // Needs input.txt (tiny Shakespeare, 1115394 characters) next to this file.
 //
-// Nothing here uses an autograd engine, so every backward pass is written out:
-// causal masked softmax, the three matmuls of attention, layer normalisation,
-// the residual splits. gradient_check() below compares the lot against central
-// differences, and is the reason to trust any of it.
+// Nothing here uses an autograd engine, so every backward pass is written by
+// hand: the causal masked softmax, the three matrix multiplies of attention,
+// layer normalisation, and the residual connections. gradient_check() below
+// compares all of them with central differences. That check is the reason to
+// trust any of this code.
 //
 // Runtime, at the video's small configuration: a few minutes in Release, and
-// seconds after that - section 6 saves a checkpoint and loads it next time. The
-// scaled-up configuration at the end of the video is four orders of magnitude
-// more arithmetic and is not reachable until the scalar loops are blocked and
-// threaded - see section 8, which measures this machine and says so.
+// seconds on later runs, because section 6 saves a checkpoint and loads it the
+// next time. The scaled-up configuration at the end of the video needs about
+// ten thousand times more arithmetic, which is too much for the scalar loops
+// used here. Section 8 measures this machine and shows the cost.
+// VariousMlp/GptScaled/gpt_scaled.cpp trains that configuration with faster
+// code.
 
 #include "gpt_model.h"
 
@@ -66,9 +70,10 @@ namespace {
 //       def forward(self, idx, targets=None):
 //           logits = self.token_embedding_table(idx)
 //
-// The video's starting point, and makemore part 1's neural net with a 65-token
-// alphabet: the embedding table *is* the logits, so the model cannot see
-// further back than one character however long the context window is.
+// The video's starting point. It is the neural net from makemore part 1, with
+// a 65-token alphabet. The embedding table *is* the logits, so the model
+// cannot see further back than one character, however long the context window
+// is.
 class Bigram {
 public:
     Bigram(int vocab, std::mt19937& g)
@@ -146,10 +151,10 @@ private:
 // The trick underneath attention
 // ---------------------------------------------------------------------------
 
-// The video spends a while on this before showing a single query or key,
-// because it is the part that looks like magic in the tensor expression. The
-// question is: how does position t get a summary of positions 0..t, in a way
-// that is one matrix multiply rather than a loop?
+// The video spends some time on this before it shows any query or key,
+// because this is the part of the tensor expression that is hardest to
+// understand. The question is: how can position t get a summary of positions
+// 0..t with one matrix multiply instead of a loop?
 //
 // Python:
 //   # version 1: an explicit loop
@@ -170,10 +175,10 @@ private:
 //   wei = F.softmax(wei, dim=-1)
 //   xbow3 = wei @ x
 //
-// Version 3 is the one that matters. The weights are no longer fixed at 1/(t+1)
-// - they come out of a softmax over numbers that start at zero but need not
-// stay there. Self-attention is version 3 with those numbers computed from the
-// data instead of being zero, and nothing else about the shape changes.
+// Version 3 is the important one. The averaging weights are no longer fixed at
+// 1/(t+1). They come out of a softmax over numbers that start at zero but can
+// change. Self-attention is version 3 with those numbers computed from the
+// data instead of being zero. Nothing else about the shape changes.
 void demonstrate_averaging() {
     constexpr int T = 6;
     constexpr int C = 2;
@@ -246,29 +251,31 @@ void demonstrate_averaging() {
 // Checking every derivative in the file
 // ---------------------------------------------------------------------------
 
-// Attention, layer normalisation and the residual splits are all hand-written
-// here, and none of them fails loudly when it is wrong - a bad sign flip or a
-// dropped term just trains a little worse, which is indistinguishable from a
-// bad learning rate. So the whole model gets differentiated numerically on a
-// deliberately tiny configuration and compared against what the backward passes
-// produced.
+// The backward passes of attention, layer normalisation and the residual
+// connections are all written by hand here. None of them shows an obvious
+// error when it is wrong: a wrong sign or a missing term only makes training a
+// little worse, which looks the same as a bad learning rate. So the whole
+// model is differentiated numerically, on a configuration that is very small
+// on purpose, and compared with the results of the backward passes.
 //
-// Dropout is set to zero for this: its mask is redrawn on every forward pass,
-// so two forward passes at x+h and x-h would not be evaluating the same
-// function. Its backward is a multiply by the stored mask, which is the one
-// derivative in this file that is obvious by inspection.
+// Dropout is set to zero for this check. Its mask is drawn again on every
+// forward pass, so the two forward passes at x+h and x-h would not compute the
+// same function. Its backward pass is a multiply by the stored mask, which is
+// the one derivative in this file that is clearly correct just from reading
+// it.
 void gradient_check(const Data& d, std::mt19937& g) {
     constexpr int kCheckBatch = 3;
     constexpr int kCheckTime = 5;
     constexpr int kProbesPerParam = 3;
 
-    // Central differences cancel the leading error terms and spend about half
-    // the mantissa doing it, so both the usable step size and the achievable
-    // agreement follow the scalar type. double leaves room for a 1e-6 step and
-    // lands near 1e-9; float cannot go below about 1e-3 without the subtraction
-    // losing every significant digit, and lands two orders of magnitude worse.
-    // The check is much weaker in float, but it still catches a wrong sign, a
-    // dropped term or a missing Bessel factor, which is what it is for.
+    // Central differences cancel the leading error terms, but they lose about
+    // half of the mantissa's precision doing it. So both the usable step size
+    // and the achievable agreement depend on the scalar type. double allows a
+    // step of 1e-6 and agrees to about 1e-9. With float, a step below about
+    // 1e-3 makes the subtraction lose all significant digits, and the
+    // agreement is about a hundred times worse. The check is much weaker in
+    // float, but it still catches a wrong sign, a missing term or a missing
+    // Bessel factor, which is its purpose.
     constexpr bool kIsFloat = std::is_same<real, float>::value;
     constexpr real kH = kIsFloat ? real(1e-3) : real(1e-6);
     constexpr real kTolerance = kIsFloat ? real(3e-2) : real(1e-6);
@@ -281,9 +288,9 @@ void gradient_check(const Data& d, std::mt19937& g) {
     std::mt19937 batch_rng(4242);
     sample_batch(d.train, kCheckBatch, kCheckTime, x, y, batch_rng);
 
-    // gamma starts at exactly 1 and every bias at exactly 0. Those are the
-    // values most likely to let a wrong expression agree with a right one by
-    // accident, so nothing is left sitting on them.
+    // gamma starts at exactly 1 and every bias at exactly 0. With those
+    // values, a wrong expression is most likely to agree with the correct one
+    // by accident. So every parameter is moved away from its starting value.
     std::normal_distribution<real> jitter(real(0), real(0.3));
     for (Param& p : model.params()) {
         for (real& v : *p.data) {
@@ -342,9 +349,10 @@ void gradient_check(const Data& d, std::mt19937& g) {
     chk.report();
 }
 
-// step_flops() in gpt_model.h, for a whole training run: the cost of one step,
-// times the steps, plus the evaluation passes, which are a sixth of the total
-// and would otherwise make the throughput below look better than it is.
+// step_flops() from gpt_model.h, applied to a whole training run: the cost of
+// one step times the number of steps, plus the evaluation passes. The
+// evaluations are a sixth of the total. Without them, the throughput below
+// would look better than it really is.
 double run_flops(const Config& cfg, size_t params, int vocab, int iters,
     int report_every) {
     const double per_step = step_flops(cfg, params, vocab);
@@ -353,17 +361,18 @@ double run_flops(const Config& cfg, size_t params, int vocab, int iters,
     return per_step * iters + per_step * evals / 3.0;
 }
 
-// Steps timed for the throughput figure in section 8, after the one untimed
-// warm-up step below. 200 was enough while every loop ran serially, because the
-// window was then just under three seconds; threading cut it to well under one,
-// short enough that scheduling and turbo jitter stopped averaging out. This is
-// a few seconds threaded and is the one part of section 8 that a serial build
-// notices.
+// The number of steps timed for the throughput figure in section 8, after the
+// one untimed warm-up step below. 200 steps were enough while every loop ran
+// serially, because they took just under three seconds. With threads they
+// took well under one second. That is too short to average out the variations
+// from thread scheduling and turbo clock speed. 1000 steps take a few seconds
+// with threads. In a serial build, this part of section 8 takes noticeably
+// longer.
 constexpr int kBenchSteps = 1000;
 
-// Timed on a throwaway model rather than on the trained one, so the number
-// means the same thing whether section 6 trained or loaded a checkpoint - and
-// so that measuring never moves weights that matter.
+// Timed on a temporary model, not on the trained one. So the number means the
+// same thing whether section 6 trained the model or loaded a checkpoint, and
+// the measurement never changes weights that matter.
 double measure_throughput(const Config& cfg, const Data& d, int vocab, int steps) {
     std::mt19937 g(1337);
     Gpt probe(cfg, vocab, g);
@@ -377,11 +386,11 @@ double measure_throughput(const Config& cfg, const Data& d, int vocab, int steps
         opt.step();
     };
 
-    // The first step pays for everything that only ever happens once: the
-    // activation buffers are allocated by that first forward pass and faulted
-    // in a page at a time, and the OpenMP pool is built at its first parallel
-    // region. Leaving those inside the clock is what made the printed rate
-    // disagree with the wall clock section 6 had just demonstrated.
+    // The first step includes all the one-time costs. The first forward pass
+    // allocates the activation buffers, and the operating system maps them
+    // into memory one page at a time. The OpenMP thread pool is created at the
+    // first parallel region. When these costs were inside the timed part, the
+    // printed rate did not match the wall-clock time measured in section 6.
     one_step();
 
     const auto t0 = std::chrono::steady_clock::now();
@@ -393,25 +402,25 @@ double measure_throughput(const Config& cfg, const Data& d, int vocab, int steps
     return step_flops(cfg, probe.parameter_count(), vocab) * steps / secs;
 }
 
-// What the layers hold between their forward and backward passes, which is
-// what actually decides whether a configuration fits in memory. Each block
-// keeps on the order of 32 (B, T, C) tensors once the feedforward's 4x hidden
-// width is counted four times over, plus six (B, heads, T, T) attention
-// tensors - and every block keeps its own at the same time. Approximate, and
-// deliberately on the high side.
+// The memory that the layers keep between their forward and backward passes.
+// This is what really decides whether a configuration fits in memory. Each
+// block keeps about 32 (B, T, C) tensors, if each feedforward tensor with its
+// 4x hidden width counts as four, plus six (B, heads, T, T) attention
+// tensors. Every block keeps its own tensors at the same time. The estimate
+// is approximate, and high on purpose.
 double activation_bytes(const Config& cfg) {
     const double per_block = 32.0 * cfg.block * cfg.n_embd
         + 6.0 * cfg.n_head * cfg.block * static_cast<double>(cfg.block);
     return cfg.n_layer * sizeof(real) * cfg.batch * per_block;
 }
 
-// Flip this to actually train the video's final model. Section 8 prints what
-// that would cost on the machine it is running on first, because at the
-// throughput this file currently reaches the answer is measured in weeks.
+// Set this to true to really train the video's final model here. Section 8
+// first prints what that would cost on the current machine, because at the
+// speed of this file's scalar loops it takes days.
 constexpr bool kRunScaleUp = false;
 
-// The numbers the video reads out, named so the Expect blocks below are claims
-// rather than magic constants.
+// The numbers that the video reports, named so that the Expect blocks below
+// read as claims instead of unexplained constants.
 constexpr real kUniformLoss = real(4.1744);   // -log(1/65)
 constexpr real kVideoBigram = real(2.48);
 constexpr real kVideoSmallTrain = real(1.99);
@@ -438,9 +447,9 @@ void test_gpt() {
     }
     printf("\n  train %zu tokens, val %zu tokens\n", d.train.size(), d.val.size());
 
-    // One batch, spelled out the way the video does before it trusts get_batch:
-    // a window of T characters is T separate examples, because position t only
-    // ever gets to see 0..t.
+    // One batch, printed in full, as the video does before it relies on
+    // get_batch. A window of T characters is T separate examples, because
+    // position t can only see positions 0..t.
     {
         std::mt19937 demo(1337);
         std::vector<int> x, y;
@@ -456,10 +465,11 @@ void test_gpt() {
         }
     }
 
-    // Pinned to tiny Shakespeare, which means pinned to the file rather than to
-    // the program. Point kCorpus at anything else and these report a mismatch
-    // and carry on, which is exactly what Expect is for - as do the loss checks
-    // further down, since the video's numbers are numbers about this text.
+    // These values belong to tiny Shakespeare, so they are facts about the
+    // data file, not about the program. With any other corpus, these checks
+    // report a mismatch and continue, which is exactly what Expect is for. The
+    // loss checks further down behave the same way, because the video's
+    // numbers are about this text.
     sanity::Expect data;
     data.equal("characters", static_cast<double>(d.train.size() + d.val.size()), 1115394);
     data.equal("vocabulary", static_cast<double>(d.vocab), 65);
@@ -565,22 +575,22 @@ void test_gpt() {
         "from here\n", r.val_loss - r.train_loss);
 
     sanity::Expect chk;
-    // Only meaningful when this run did the training; a loaded model has no
-    // step 0 to have scored.
+    // This only makes sense when this run did the training. A loaded model has
+    // no step 0 with a recorded loss.
     if (!loaded) {
         chk.close("loss before training", r.first_loss, kUniformLoss, 0.6);
     }
     chk.that("the transformer beats the bigram baseline",
         r.val_loss < bigram_result.val_loss);
-    // Not all of this gap is memorisation. The split is positional - the
-    // validation set is the last tenth of the file - so it is different scenes
-    // with different characters, and some of the distance is the model being
-    // asked about text that is genuinely unlike what it trained on. What the
-    // threshold is for is the runaway case: forty thousand parameters against a
-    // million training tokens cannot memorise, and a gap several times this
-    // size would mean something else is wrong. The video's own run of this
-    // configuration sits at about 0.09, and it is the growth of this number
-    // rather than its value that makes it add dropout before scaling up.
+    // Not all of this gap is memorisation. The split is by position: the
+    // validation set is the last tenth of the file. So it contains different
+    // scenes with different characters, and part of the gap comes from text
+    // that is really unlike the training text. The threshold is for the
+    // extreme case. Forty thousand parameters cannot memorise a million
+    // training tokens, so a gap several times this size would mean that
+    // something else is wrong. In the video's own run of this configuration,
+    // the gap is about 0.09. The video adds dropout before scaling up because
+    // this gap grows during training, not because of its size.
     chk.that("the train/val gap is drift, not memorisation",
         r.val_loss - r.train_loss < 0.25);
     chk.close("validation loss", r.val_loss, kVideoSmallGpt, 0.15);
@@ -604,9 +614,9 @@ void test_gpt() {
         big.n_embd, big.n_head, big.n_layer, big.block, big.batch,
         big.dropout, big.lr);
 
-    // Constructing it costs the weights and their gradients and nothing else -
-    // the activation buffers below are only allocated by a forward pass, which
-    // is the whole point of printing their size before running one.
+    // Creating the model allocates only the weights and their gradients. The
+    // activation buffers are only allocated by a forward pass. That is why
+    // their size can be printed here, before any forward pass runs.
     size_t big_params = 0;
     {
         std::mt19937 gp(1337);
@@ -638,14 +648,14 @@ void test_gpt() {
         "  and measures what the pair is worth at the scaled-up width.\n";
 
     // Outside a template, `if constexpr` still compiles and type-checks the
-    // branch it discards, which is the point of having it here rather than
-    // in a comment.
+    // branch that it discards. That is why this code is in an `if constexpr`
+    // and not in a comment.
     if constexpr (kRunScaleUp) {
         std::mt19937 gb(1337);
         Gpt big_model(big, d.vocab, gb);
 
-        // The whole reason checkpoints exist: this branch is an overnight run
-        // once, and a second or two every time after.
+        // This is the main reason why checkpoints exist: the first run of this
+        // branch is very long, and every later run takes a second or two.
         const std::string bckpt = d.dir + checkpoint_name(big, d);
         if (load_params(big_model.params(), big, d, bckpt)) {
             const Losses l = estimate_loss(big_model, d, big.batch, big.block);

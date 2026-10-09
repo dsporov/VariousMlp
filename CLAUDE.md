@@ -109,6 +109,17 @@ for (int i = 0; i < n; ++i) { sum += x[i]; }
 - ASCII only, comments included.
 - Comments explain *why*, in prose sentences, at the density of the surrounding
   file. No narration of lines that speak for themselves.
+- Write comments in plain English that a non-native reader can follow:
+  - short sentences with one idea each, not long chains joined by dashes;
+  - literal words, not idioms, metaphors or figurative phrasal verbs ("pile
+    up", "falls out of", "is load-bearing", "takes badly");
+  - "if" instead of inverted conditionals ("Should this throw...", "Were
+    each side to...") and imperative conditionals ("Raise kSteps and...");
+  - name the thing instead of "that one" or "the two" when the thing is not
+    in the same sentence;
+  - "weight" only for model parameters ("scale factor" otherwise), and a
+    bare "split" only for train/validation (how a batch is divided between
+    GPU and CPU is the GPU's "share" or the "GPU/CPU split").
 - Named `constexpr` constants (`kVocab`, `kInputs`) rather than bare literals.
 
 ## Sanity checks

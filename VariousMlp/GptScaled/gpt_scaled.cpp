@@ -1,55 +1,59 @@
 // gpt_scaled.cpp - the video's scale-up, trained on the GPU and the CPU at once.
 //
-// The end of the video turns the walkthrough's model into a real one: 384
-// channels, 6 heads, 6 blocks, a context of 256 characters, batches of 64,
-// dropout 0.2 - 10.8M parameters, validation loss 1.48, about fifteen minutes
-// on an A100. gpt.cpp records that run rather than making it. This program
-// makes it, with the two fastest things the repository has: the hand-written
-// CUDA model and the cache-blocked AVX2 multiply, sharing every batch the way
-// gpt_split.cpp shares it.
+// At the end of the video, the walkthrough's model grows into a real one: 384
+// channels, 6 heads, 6 blocks, a context of 256 characters, batches of 64 and
+// dropout 0.2. That is 10.8M parameters. The video reaches a validation loss
+// of 1.48 in about fifteen minutes on an A100. gpt.cpp only records that run;
+// it does not perform it. This program performs it. It uses the two fastest
+// implementations in the repository, the hand-written CUDA model and the
+// cache-blocked AVX2 multiply, and shares every batch between them in the same
+// way as gpt_split.cpp.
 //
-// gpt_split itself cannot train this shape on a GTX 1050 Ti, and not because
-// of the parameters - weights, gradients and both Adam moments together are
-// 173MB. It is the activations. At context 256 the GPU model keeps about 85MB
-// a window between its forward and backward passes, two thirds of it in
-// (B, T, C) tensors and the rest in (B, heads, T, T) attention squares, so
-// the 38 windows of gpt_split's opening share want 3.2GB of a card that has
-// 4GB and also holds the CUDA context and, under Windows, the desktop. And
-// the share only grows from there when the GPU turns out to be the faster
-// side.
+// gpt_split itself cannot train this shape on a GTX 1050 Ti. The parameters
+// are not the problem: weights, gradients and both Adam moments together are
+// 173MB. The activations are the problem. At context 256 the GPU model keeps
+// about 85MB per window between its forward and backward passes. Two thirds
+// of that is in (B, T, C) tensors, and the rest is in the (B, heads, T, T)
+// attention matrices. At the start, gpt_split gives the GPU 38 windows, which
+// need 3.2GB. The card has 4GB, and that memory also holds the CUDA context
+// and, under Windows, the desktop. The GPU's share also grows later if the GPU
+// turns out to be the faster side.
 //
-// So the GPU takes its windows in chunks, at most kGpuChunk to a call, and
-// every chunk reuses the same buffers. Nothing in gpt_cuda.cu had to change
-// for that: its backward passes add into the gradient rather than overwrite
-// it, so the chunks' gradients pile up on the device and cross to the host
-// once a step. The one thing to get right is the weight. Each call's loss,
-// and so its gradient, is a mean over that call's windows only, which makes
-// the pile a sum of means. With c chunks of k windows it is c times the mean
-// over the GPU's c*k windows, so its weight in the batch's mean is k/B rather
-// than c*k/B:
+// So the GPU processes its windows in chunks of at most kGpuChunk windows per
+// call, and every chunk reuses the same buffers. Nothing in gpt_cuda.cu had to
+// change for this. Its backward passes add into the gradient instead of
+// overwriting it, so the gradients of all chunks accumulate on the device and
+// are copied to the host once per step. The one thing to get right is the
+// scale factor for that sum. The loss of each call, and so its gradient, is a
+// mean over the windows of that call only. So the accumulated gradient is a
+// sum of means. With c chunks of k windows each, it is c times the mean over
+// all c*k GPU windows. Its scale factor in the batch mean is therefore k/B,
+// not c*k/B:
 //
 //     g = (k / B) * (g_1 + ... + g_c) + ((B - c*k) / B) * g_cpu
 //
-// That needs every chunk the same size, so the GPU's share is rounded down to
-// a multiple of its chunk count - 38 windows become three chunks of 12.
-// Section 1 holds the result to the scalar reference.
+// This needs every chunk to have the same size, so the GPU's share is rounded
+// down to a multiple of its chunk count: 38 windows become three chunks of 12.
+// Section 1 compares the result with the scalar reference.
 //
-// Everything else is gpt_split's: the CPU's copy of the weights is the
-// master, AdamW runs there and the weights go to the GPU after every step,
-// and the split moves toward where both sides finish together.
+// Everything else works as in gpt_split. The CPU's copy of the weights is the
+// master copy. AdamW runs on the CPU, and the weights are copied to the GPU
+// after every step. The GPU's share of each batch moves toward the point where
+// both sides finish at the same time.
 //
-// This directory is a project of its own. check.h, gpt_gemm.h, gpt_model.h,
-// gpt_cuda.h and gpt_cuda.cu are copies of the files in makemore/, and
-// nothing here includes anything from there. It touches the rest of the
-// repository only through files on disk: it reads makemore/input.txt, and it
-// saves the trained weights beside it in gpt_model.h's checkpoint format,
-// under gpt_model.h's name for this shape - the file gpt.cpp's scale-up
-// branch looks for, and one the chat tool can read.
+// This directory is a separate project. check.h, gpt_gemm.h, gpt_model.h,
+// gpt_cuda.h and gpt_cuda.cu are copies of the files in makemore/, and nothing
+// here includes a file from makemore/. The only contact with the rest of the
+// repository is through files on disk. The program reads makemore/input.txt.
+// It saves the trained weights next to that file, in gpt_model.h's checkpoint
+// format and under gpt_model.h's file name for this shape. gpt.cpp's scale-up
+// branch looks for that file, and the chat tool can read it.
 //
-// Expect a few hours: 5000 steps of 1.1 TFLOP each, and the video's eleven
-// evaluations of 200 batches on each split.
+// Expect a run of a few hours: 5000 steps of 1.1 TFLOP each, plus the video's
+// eleven evaluations of 200 batches on each of the training and validation
+// sets.
 //
-// CMake-only, because it has its own main, and built only when CUDA is found.
+// CMake only, because it has its own main, and built only when CUDA is found.
 // Build the gpt_scaled target.
 
 #include <algorithm>
@@ -80,60 +84,65 @@ namespace {
 // kEvalIters in gpt_model.h, and the model's shape is the kBig constants.
 constexpr int kEvalEvery = 500;
 
-// Evaluations are 500 steps apart, which at this size is minutes rather than
-// seconds, so a line of progress goes out more often than that.
+// Evaluations are 500 steps apart, which at this size means several minutes.
+// So a progress line is printed more often than that.
 constexpr int kProgressEvery = 100;
 
-// The most windows the GPU is handed in one call. Its activations and scratch
-// are sized by the largest call, at about 85MB a window at this shape, so
-// sixteen is 1.4GB and leaves a 4GB card room for the weights, the CUDA
-// context and the desktop. Larger chunks mean fewer launches, but 16 windows
-// are already 4096 rows, which gives a multiply far more tiles than the
-// GTX 1050 Ti's six SMs can run at once.
+// The largest number of windows the GPU gets in one call. Its activation and
+// scratch buffers are sized for the largest call, and at this shape they need
+// about 85MB per window. Sixteen windows need 1.4GB, which leaves room on a 4GB
+// card for the weights, the CUDA context and the desktop. Larger chunks would
+// mean fewer kernel launches. But 16 windows are already 4096 rows, which
+// gives each multiply far more tiles than the six SMs of the GTX 1050 Ti can
+// run at once.
 constexpr int kGpuChunk = 16;
 
-// The GPU's share of each batch before anything has been timed, as in
-// gpt_split.cpp: 504 GFLOP/s against the blocked multiply's 319, measured at
-// context 64. Context 256 weighs attention more heavily, and the split finds
-// its own level within a few dozen steps.
+// The GPU's share of each batch before any step has been timed, as in
+// gpt_split.cpp. It comes from the speeds measured at context 64: 504 GFLOP/s
+// on the GPU and 319 GFLOP/s for the blocked multiply. At context 256,
+// attention is a larger part of the work. The share adjusts itself within a
+// few dozen steps.
 constexpr double kInitialGpuShare = 0.6;
 
-// How far one step's timing moves the running estimates. Low enough that one
-// slow step does not swing the split, high enough to settle quickly.
+// How much one step's timing changes the running averages. It is low enough
+// that one slow step does not move the GPU's share much, and high enough that
+// the share settles quickly.
 constexpr double kSmoothing = 0.25;
 
-// The thread that drives the GPU is busy for the whole of its half, waiting
-// on copies, which the CUDA runtime does by spinning. The CPU half gives up a
-// thread to it rather than oversubscribing the cores, which an OpenMP team,
-// waiting at every barrier for its slowest member, takes badly.
+// The thread that drives the GPU is busy for the whole GPU half, because the
+// CUDA runtime waits for copies by spinning. So the CPU half uses one thread
+// fewer, and the cores are not oversubscribed. Oversubscription slows an
+// OpenMP team down a lot, because the team waits at every barrier for its
+// slowest thread.
 constexpr int kGpuDriverThreads = 1;
 
-// Section 1's batch: few enough windows at full context that the scalar
-// reference gets through them in seconds, in chunks small enough that the
-// GPU's share takes more than one call - which is the thing being checked.
+// The batch for section 1. It has few enough windows at full context that the
+// scalar reference finishes them in seconds. The chunks are small enough that
+// the GPU's share needs more than one call, because that is what the section
+// checks.
 constexpr int kCheckBatch = 6;
 constexpr int kCheckChunk = 2;
 
-// gpt_bench.h's tolerances. A gradient tensor has to match the reference's to
-// this fraction of its largest entry: float rounding in a different order
-// lands around 1e-6 to 1e-5, and a chunk weighted wrongly, or lost, in the
-// tenths.
+// The tolerances from gpt_bench.h. A gradient tensor has to match the
+// reference's to this fraction of its largest entry. Float rounding in a
+// different order gives errors of about 1e-6 to 1e-5. A chunk with the wrong
+// scale factor, or a lost chunk, gives errors of about 0.1.
 constexpr double kGradTolerance = 1e-3;
 constexpr double kLossTolerance = 1e-4;
 
 // An untrained model gives every character about the same probability, so its
-// loss starts near ln(vocab) - a little above, since weights of width 0.02
-// already make the logits uneven.
+// loss starts near ln(vocab). It starts a little above that, because weights
+// with a standard deviation of 0.02 already make the logits uneven.
 constexpr double kStartTolerance = 0.2;
 
-// The video's validation loss at the end, as gpt_model.h records it. This
-// run's initial weights, batches and dropout masks are all its own, so it
-// should land near that rather than on it.
+// The video's final validation loss, as recorded in gpt_model.h. This run has
+// its own initial weights, batches and dropout masks, so its result should be
+// close to this value, not equal to it.
 constexpr double kVideoVal = 1.48;
 constexpr double kVideoValTolerance = 0.05;
 
-// Characters to sample from the trained model. On the CPU, because gpt_cuda.h
-// hands back losses and never logits.
+// The number of characters to sample from the trained model. Sampling runs on
+// the CPU, because gpt_cuda.h returns losses and never logits.
 constexpr int kSampleLength = 1000;
 
 using Clock = std::chrono::steady_clock;
@@ -142,7 +151,7 @@ double seconds_since(Clock::time_point t0) {
     return std::chrono::duration<double>(Clock::now() - t0).count();
 }
 
-// A running average that takes its first sample as it is.
+// A running average. The first sample is used as it is.
 class Smoothed {
 public:
     void add(double sample) {
@@ -159,8 +168,8 @@ private:
     bool seen_ = false;
 };
 
-// Sets the OpenMP team size for this thread's parallel regions for the length
-// of one call, and puts back what was there.
+// Sets the OpenMP team size for this thread's parallel regions during one
+// call, and restores the previous size afterwards.
 class ThreadLimit {
 public:
     explicit ThreadLimit(int n) : saved_(available_threads()) {
@@ -186,10 +195,10 @@ private:
     int saved_;
 };
 
-// Sets the multiply gpt_model.h runs for the length of one call, and puts
-// back what was there. The switch is process-wide, but only the main thread
-// ever runs the CPU model: the blocked multiply for the split's CPU half and
-// for sampling, the scalar loops for section 1's reference.
+// Selects which multiply gpt_model.h runs during one call, and restores the
+// previous choice afterwards. The switch is process-wide, but only the main
+// thread ever runs the CPU model. It uses the blocked multiply for the CPU
+// half and for sampling, and the scalar loops for the reference in section 1.
 class UsingKernels {
 public:
     explicit UsingKernels(Kernels k) : saved_(active_kernels()) {
@@ -207,8 +216,8 @@ private:
     Kernels saved_;
 };
 
-// How a batch's windows are dealt out: chunks calls of chunk windows each on
-// the GPU, from the front of the batch, and the rest on the CPU.
+// How the windows of a batch are divided. The GPU gets the first windows of
+// the batch, in `chunks` calls of `chunk` windows each. The CPU gets the rest.
 struct Division {
     int chunks;
     int chunk;
@@ -218,14 +227,14 @@ struct Division {
     }
 };
 
-// One side's part of a pass: the mean loss over its windows, and how long it
-// took.
+// The result of one side's part of a pass: the mean loss over its windows,
+// and the time it took.
 struct Half {
     real loss;
     double seconds;
 };
 
-// Where the training steps went, smoothed over the last few.
+// Where the time of a training step went, averaged over the last few steps.
 struct StepTimes {
     int gpu_windows = 0;
     int gpu_chunks = 0;
@@ -238,8 +247,8 @@ struct StepTimes {
 };
 
 // The model twice, once on each side, with every batch shared between them.
-// It has the members gpt_model.h's estimate_loss asks of a model, so the
-// video's evaluation is shared the same way.
+// It has the members that estimate_loss in gpt_model.h needs from a model, so
+// the video's evaluation is shared between the two sides too.
 class SplitModel {
 public:
     SplitModel(const Config& cfg, int vocab, int gpu_chunk, std::mt19937& g)
@@ -251,7 +260,7 @@ public:
           cpu_threads_(std::max(1, available_threads() - kGpuDriverThreads)) {
         CHECK(gpu_chunk > 0, "GPU calls of " << gpu_chunk << " windows");
 
-        // combine() walks the two sets of gradients side by side, so they
+        // combine() goes through the two sets of gradients together, so they
         // have to be the same tensors in the same order.
         const std::vector<size_t>& sizes = gpu_.tensor_sizes();
         const std::vector<Param>& tensors = cpu_.params();
@@ -268,8 +277,8 @@ public:
     SplitModel(const SplitModel&) = delete;
     SplitModel& operator=(const SplitModel&) = delete;
 
-    // The CPU's copy is the master: the one AdamW steps, the one saved, and
-    // the one sampled from.
+    // The CPU's copy is the master copy. AdamW updates it, and it is the copy
+    // that is saved and sampled from.
     Gpt& cpu_model() {
         return cpu_;
     }
@@ -278,7 +287,7 @@ public:
         return cpu_.params();
     }
 
-    // Another model's weights, on both sides.
+    // Copies another model's weights to both sides.
     void load(const std::vector<Param>& weights) {
         std::vector<Param>& mine = cpu_.params();
         CHECK(weights.size() == mine.size(), weights.size()
@@ -292,8 +301,9 @@ public:
         upload_weights();
     }
 
-    // A checkpoint in gpt_model.h's format. A missing or stale one is not an
-    // error, as there: it means train instead.
+    // Loads a checkpoint in gpt_model.h's format. As in gpt_model.h, a
+    // missing or outdated checkpoint is not an error. It only means that the
+    // model has to be trained.
     bool load_checkpoint(const Config& cfg, const Data& d, const std::string& path) {
         if (!load_params(cpu_.params(), cfg, d, path)) {
             return false;
@@ -308,11 +318,11 @@ public:
         zeroed_ = true;
     }
 
-    // How a batch of B windows is dealt out at the current share. Both sides
-    // get at least one window whenever there are two to go round, so that
-    // both are always being timed and the split can keep moving; a single
-    // window cannot be split, and goes to the GPU. The GPU's share is then
-    // rounded down to equal chunks, which combine() relies on.
+    // How a batch of B windows is divided at the current share. If there are
+    // at least two windows, each side gets at least one. Then both sides are
+    // always timed, and the share can keep adjusting. A single window cannot
+    // be divided, so it goes to the GPU. The GPU's share is then rounded down
+    // to chunks of equal size, which combine() relies on.
     Division division(int B) const {
         CHECK(B > 0, "a batch of " << B << " windows");
         if (B == 1) {
@@ -340,8 +350,8 @@ public:
         combine(div, B);
         const double combine_s = seconds_since(start);
 
-        // The first step pays for first touch on both sides, and would skew
-        // the split if it counted.
+        // The first step includes one-time costs on both sides, such as the
+        // first touch of new memory. Counting it would distort the share.
         if (steps_ > 1 && n < B) {
             gpu_window_s_.add(gpu.seconds / n);
             cpu_window_s_.add(cpu.seconds / (B - n));
@@ -400,8 +410,8 @@ public:
     }
 
 private:
-    // The GPU's windows on a thread of their own and the rest on this one, at
-    // the same time.
+    // Runs the GPU's windows on a separate thread and the rest on this
+    // thread, at the same time.
     std::pair<Half, Half> both_halves(const int* x, const int* y, Division div,
         int B, int T, bool backward) {
         std::future<Half> gpu_half = std::async(std::launch::async,
@@ -409,9 +419,9 @@ private:
                 return run_gpu(x, y, div, T, backward);
             });
 
-        // Should this half throw, gpu_half's destructor waits for the GPU's
-        // before the exception leaves, so the thread never outlives the
-        // buffers it writes.
+        // If this half throws, the destructor of gpu_half waits for the GPU
+        // half to finish before the exception leaves this function. So the
+        // thread never outlives the buffers it writes to.
         Half cpu{ real(0), 0.0 };
         const int n = div.gpu_windows();
         if (n < B) {
@@ -427,10 +437,10 @@ private:
         return { gpu_half.get(), cpu };
     }
 
-    // The GPU's windows, a chunk at a time. The gradients pile up on the
-    // device from one call to the next and come back once, after the last.
-    // With every chunk the same size, the mean of their losses is the mean
-    // over all of the GPU's windows.
+    // Runs the GPU's windows one chunk at a time. The gradients accumulate on
+    // the device from one call to the next, and are copied back once, after
+    // the last call. Because every chunk has the same size, the mean of the
+    // chunk losses is the mean over all of the GPU's windows.
     Half run_gpu(const int* x, const int* y, Division div, int T, bool backward) {
         const Clock::time_point start = Clock::now();
         const size_t stride = static_cast<size_t>(div.chunk) * static_cast<size_t>(T);
@@ -449,18 +459,20 @@ private:
         return Half{ static_cast<real>(total / div.chunks), seconds_since(start) };
     }
 
-    // Each side's mean, weighted by how many windows it saw. In double, since
-    // section 1 holds this to 1e-4 of the reference's.
+    // The mean loss over the whole batch: each side's mean loss counts in
+    // proportion to its number of windows. It is computed in double, because
+    // section 1 requires it to match the reference to 1e-4.
     static real mean_loss(real gpu, real cpu, int n, int B) {
         const double sum = static_cast<double>(n) * static_cast<double>(gpu)
             + static_cast<double>(B - n) * static_cast<double>(cpu);
         return static_cast<real>(sum / static_cast<double>(B));
     }
 
-    // Turns the CPU model's gradients, a mean over its own windows, into the
-    // mean over the whole batch, with the GPU's sum of chunk means weighted by
-    // one chunk's size as the comment at the top works out. Split by tensor,
-    // like AdamW, for one fork a step.
+    // Turns the CPU model's gradients, which are a mean over its own windows,
+    // into the mean over the whole batch. The GPU's sum of chunk means is
+    // scaled by k/B, as the comment at the top of this file explains. The work
+    // is divided by tensor, as in AdamW, so there is only one OpenMP fork per
+    // step.
     void combine(Division div, int B) {
         const int n = div.gpu_windows();
         const real wg = static_cast<real>(div.chunk) / static_cast<real>(B);
@@ -509,15 +521,16 @@ private:
     int steps_ = 0;
     bool zeroed_ = false;
 
-    // Kept between steps so that their capacity is too.
+    // Kept between steps so that their allocated memory is reused.
     std::vector<std::vector<float>> gpu_grads_;
     std::vector<std::vector<float>> staged_;
 };
 
 // The largest difference between two tensors, as a fraction of the largest
-// entry in either: gpt_bench.h's measure. Relative to the tensor rather than
-// element by element, because an entry that should be zero comes out as
-// rounding noise on both sides and the ratio of two noises means nothing.
+// entry in either one. This is the measure gpt_bench.h uses. It is relative to
+// the whole tensor, not to each element. An entry that should be zero comes
+// out as rounding noise on both sides, and the ratio of two noise values
+// means nothing.
 double tensor_error(const std::vector<real>& a, const std::vector<real>& b) {
     double diff = 0.0;
     double scale = 0.0;
@@ -555,10 +568,10 @@ void print_config(const Config& cfg) {
         static_cast<double>(cfg.dropout), static_cast<double>(cfg.lr));
 }
 
-// One forward and backward pass at the scale-up's width and context, on the
-// split and on the scalar reference, from the same weights on the same batch,
-// and every gradient tensor compared. Without dropout, since the two would
-// draw different masks.
+// Runs one forward and backward pass at the scale-up's width and context, on
+// the GPU/CPU split model and on the scalar reference. Both start from the
+// same weights and use the same batch, and every gradient tensor is compared.
+// Dropout is off, because the two models would draw different masks.
 void check_split(const Data& d) {
     std::cout << "\n== 1. the chunked split against the reference ==\n";
     const Config cfg{ kBigEmbed, kBigHeads, kBigLayers, kBigBlock, kCheckBatch,
@@ -568,8 +581,8 @@ void check_split(const Data& d) {
     std::mt19937 g(1337);
     Gpt ref(cfg, d.vocab, g);
 
-    // The split's own initial weights are thrown away by load(), so the
-    // generator it draws them from does not matter.
+    // load() replaces the split model's own initial weights, so the
+    // generator that creates them does not matter.
     std::mt19937 unused(0);
     SplitModel split(cfg, d.vocab, kCheckChunk, unused);
     split.load(ref.params());
@@ -584,8 +597,8 @@ void check_split(const Data& d) {
         ref_loss = ref.forward_backward(x.data(), y.data(), cfg.batch, cfg.block);
     }
 
-    // The share only moves once a step has been timed, so this is the
-    // division the pass below uses.
+    // The share only changes after a step has been timed, so this is the
+    // division that the pass below uses.
     const Division div = split.division(cfg.batch);
     split.zero_grad();
     const real split_loss = split.forward_backward(x.data(), y.data(), cfg.batch,
@@ -606,12 +619,13 @@ void check_split(const Data& d) {
     chk.report();
 }
 
-// Whether the loop below evaluates before step it: the video's schedule.
+// Whether the loop below evaluates the model before step `it`, following the
+// video's schedule.
 bool evaluates_at(int it) {
     return it % kEvalEvery == 0 || it == kIters - 1;
 }
 
-// How many of those evaluations are at step it or later.
+// How many of those evaluations happen at step `it` or later.
 int evaluations_from(int it) {
     int n = 0;
     for (int j = it; j < kIters; ++j) {
@@ -646,7 +660,7 @@ int evaluations_from(int it) {
 //       loss.backward()
 //       optimizer.step()
 //
-// Returns whether it trained, which it does not when an earlier run left a
+// Returns whether it trained. It does not train if an earlier run left a
 // checkpoint to load.
 bool train_or_load(const Data& d, const Config& cfg, SplitModel& model,
     std::mt19937& g) {
@@ -706,8 +720,8 @@ bool train_or_load(const Data& d, const Config& cfg, SplitModel& model,
         recent_loss += static_cast<double>(loss);
 
         if ((it + 1) % kProgressEvery == 0) {
-            // The steps left at the average step so far, and the evaluations
-            // left at the average evaluation.
+            // The remaining steps at the average step time so far, plus the
+            // remaining evaluations at the average evaluation time.
             const double left_s = (kIters - it - 1) * step_s / (it + 1)
                 + evaluations_from(it + 1) * eval_s / evals;
             printf("      %d steps, batch loss %.4f, %.0f ms a step, %.0f GFLOP/s, "
@@ -735,8 +749,9 @@ bool train_or_load(const Data& d, const Config& cfg, SplitModel& model,
     return true;
 }
 
-// A step is its slower half plus the two serial stages after it, so this says
-// whether what is left to win is in the balance or in the exchange.
+// A step takes as long as its slower half, plus the two serial stages after
+// it. So this output shows where more speed could come from: a better balance
+// between the two halves, or a faster exchange of gradients and weights.
 void print_times(const SplitModel& model, bool trained) {
     std::cout << "\n== 3. where the training steps went ==\n";
     if (!trained) {
@@ -773,11 +788,12 @@ void sample(const Data& d, SplitModel& model) {
 }  // namespace
 
 int main() {
-    // A CHECK that fires - a CUDA call that failed included, on either thread
-    // - is reported and ends the program rather than being left to terminate().
+    // A failed CHECK, including a failed CUDA call on either thread, is
+    // reported here and ends the program. Without this, it would reach
+    // terminate().
     try {
         // Started before anything else, so the total at the end covers every
-        // section, the check and the sample included.
+        // section, including the check and the sampling.
         const Clock::time_point start = Clock::now();
         printf("gpt_scaled: the video's scale-up, each batch shared between CUDA "
             "and the blocked multiply\n");
@@ -793,8 +809,8 @@ int main() {
 
         check_split(d);
 
-        // Seeded as gpt.cpp seeds its scale-up, so the two start from the
-        // same weights.
+        // Seeded in the same way as gpt.cpp's scale-up, so both programs start
+        // from the same weights.
         const Config cfg{ kBigEmbed, kBigHeads, kBigLayers, kBigBlock, kBigBatch,
             kBigDropout, kBigLr };
         std::mt19937 g(1337);

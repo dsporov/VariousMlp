@@ -1,14 +1,15 @@
 // gpt_cuda.h - the host side of the model in gpt_cuda.cu.
 //
 // Nothing here mentions CUDA. The model's device buffers and kernels all stay
-// inside gpt_cuda.cu behind an opaque Impl, so gpt_cuda_main.cpp -
-// and gpt_model.h, which it includes - are compiled by the ordinary host
-// compiler and never pass through nvcc. The price is that this interface
-// speaks plain floats rather than gpt::real, and gpt_cuda_main.cpp converts.
+// inside gpt_cuda.cu, behind an opaque Impl. So gpt_cuda_main.cpp, and the
+// gpt_model.h that it includes, are compiled by the normal host compiler and
+// never by nvcc. The cost is that this interface uses plain floats instead of
+// gpt::real, so gpt_cuda_main.cpp has to convert.
 //
-// Float only. The GTX 1050 Ti this was written for runs double at 1/32 of its
-// float rate, and a double build of the reference still checks it to within
-// float rounding, which is all a float model can be held to anyway.
+// Float only. The GTX 1050 Ti that this was written for runs double at 1/32 of
+// its float speed. A double build of the reference can still check this model
+// to within float rounding, and a float model cannot be more exact than that
+// anyway.
 
 #pragma once
 
@@ -19,9 +20,10 @@
 
 namespace gpt_cuda {
 
-// What gpt::Config says about the shape of the weights, plus the vocabulary
-// and the dropout rate. Batch size is not in it: every call says how big its
-// batch is, and the activation buffers grow to fit the largest seen so far.
+// The parts of gpt::Config that define the shape of the weights, plus the
+// vocabulary size and the dropout rate. The batch size is not here: every call
+// passes its own batch size, and the activation buffers grow to fit the
+// largest batch so far.
 struct Shape {
     int n_embd;
     int n_head;
@@ -42,7 +44,7 @@ public:
     // The size of every tensor, in the order gpt::Gpt collects its parameters.
     const std::vector<size_t>& tensor_sizes() const;
 
-    // Weights in, gradients out, in that same order.
+    // Weights are copied in, and gradients copied out, in that same order.
     void load(const std::vector<std::vector<float>>& weights);
     void read_grads(std::vector<std::vector<float>>& out) const;
 

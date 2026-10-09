@@ -1,31 +1,32 @@
-// gpt_chat.cpp - a prompt for the model gpt.cpp trains.
+// gpt_chat.cpp - an interactive prompt for the model that gpt.cpp trains.
 //
-// Read this part before being disappointed by the output. The model was
-// trained on exactly one objective: given the last few characters of its
-// corpus, predict the next one. That is all it knows how to do, so what it
-// does with a line you type is *continue* it, not reply to it. Ask it the
-// capital of France and it will write you a stage direction.
+// Read this part first, so that the output does not disappoint you. The model
+// was trained for exactly one task: given the last few characters of its
+// corpus, predict the next one. That is all it can do. So it *continues* the
+// line you type; it does not reply to it. If you ask it for the capital of
+// France, it will write a stage direction.
 //
-// That is not a shortcoming of this file, and no amount of sampling code fixes
-// it. Three separate things stand between a model like this and one that
+// This is not a weakness of this file, and no sampling code can fix it. Three
+// separate things are missing between a model like this and a model that
 // answers questions:
 //
-//   - scale. 10.8M parameters over a megabyte of text. GPT-2 small is 117M
-//     over 40GB, and instruction-following does not appear below roughly a
-//     billion parameters on hundreds of gigabytes.
-//   - the objective. Predicting the next token of a corpus gives you a model
-//     of that corpus. Question answering falls out of pretraining only when the
-//     corpus is full of questions being answered. The internet is. Shakespeare
-//     is not.
-//   - the stages after pretraining. Even a 175B base model completes documents
-//     rather than answering; supervised fine-tuning on instruction/response
-//     pairs and then preference optimisation are what turn one into the other.
-//     The video ends by saying exactly this: what it builds is stage one.
+//   - scale. This model has 10.8M parameters, trained on one megabyte of
+//     text. GPT-2 small has 117M parameters, trained on 40GB. The ability to
+//     follow instructions does not appear below roughly a billion parameters
+//     trained on hundreds of gigabytes.
+//   - the objective. Predicting the next token of a corpus gives a model of
+//     that corpus. Pretraining produces question answering only if the corpus
+//     is full of questions with answers. The internet is. Shakespeare is not.
+//   - the stages after pretraining. Even a 175B base model continues
+//     documents instead of answering. Supervised fine-tuning on
+//     instruction/response pairs, followed by preference optimisation, is
+//     what turns a base model into an assistant. The video ends by saying
+//     exactly this: what it builds is the first stage.
 //
-// So this is a text continuer, which is the real capability and is worth
-// having. Point kCorpus at a corpus of questions and answers and it will
-// produce well-formed questions and answers that mean nothing, which is its own
-// kind of interesting: format is learned long before content.
+// So this is a tool that continues text. That is the model's real ability, and
+// it is worth having. If you train it on a corpus of questions and answers, it
+// will produce well-formed questions and answers that mean nothing. That is
+// interesting in its own way: the format is learned long before the content.
 //
 // Run it with `VariousMlp.exe chat`. It needs a checkpoint, which section 6 of
 // the walkthrough writes.
@@ -47,10 +48,10 @@ using namespace gpt;
 
 namespace {
 
-// The two configurations the walkthrough trains, narrowed to inference. batch,
-// dropout and the learning rate are free to be anything here: checkpoint_name
-// does not use them, and load_params validates only the five fields that
-// change the shape of the weights.
+// The two configurations that the walkthrough trains, reduced to what
+// inference needs. batch, dropout and the learning rate can have any value
+// here: checkpoint_name does not use them, and load_params checks only the
+// five fields that change the shape of the weights.
 std::vector<Config> inference_configs() {
     return {
         { kEmbed, kHeads, kLayers, kBlock, 1, real(0), kLr },
@@ -58,9 +59,10 @@ std::vector<Config> inference_configs() {
     };
 }
 
-// Text to token ids. A character the corpus never contained has no row in the
-// embedding table, so there is nothing the model could do with it; dropping it
-// and saying so is better than substituting something and not saying so.
+// Converts text to token ids. A character that the corpus never contained has
+// no row in the embedding table, so the model cannot use it. It is better to
+// drop such a character and report it than to replace it silently with
+// something else.
 std::vector<int> encode(const Data& d, const std::string& s, size_t* dropped) {
     std::vector<int> ids;
     ids.reserve(s.size());
@@ -93,8 +95,8 @@ void print_help(const Options& opt) {
         opt.length, static_cast<double>(opt.temperature));
 }
 
-// True if the line was a command rather than a prompt. A prompt that genuinely
-// begins with a colon is unreachable, which for this corpus is no loss.
+// Returns true if the line was a command, not a prompt. So a prompt cannot
+// start with a colon, which does not matter for this corpus.
 bool command(const std::string& line, Options& opt, bool& quit) {
     if (line.empty() || line[0] != ':') {
         return false;
@@ -139,9 +141,10 @@ bool command(const std::string& line, Options& opt, bool& quit) {
     return true;
 }
 
-// Looks for a checkpoint belonging to each configuration in turn. The file is
-// probed before the model is built, because constructing the scaled-up one
-// allocates 173MB of weights and gradients that would be thrown away.
+// Looks for a checkpoint for each configuration in turn. The code checks that
+// the file exists before it builds the model, because building the scaled-up
+// model allocates 86MB of weights and gradients. Without a file, that memory
+// would be wasted.
 std::unique_ptr<Gpt> load_any(const Data& d, std::string& from) {
     std::mt19937 init(1337);
     for (const Config& cfg : inference_configs()) {
@@ -211,8 +214,8 @@ void test_gpt_chat() {
                 dropped);
         }
 
-        // The prompt is echoed with the continuation so the two read as one
-        // piece of text, which is what they are.
+        // The prompt is printed together with the continuation, so that the
+        // two read as one piece of text, which is what they are.
         const std::vector<int> out =
             model->generate(prompt, opt.length, opt.temperature, rng);
         std::cout << line << d.decode(out) << "\n";

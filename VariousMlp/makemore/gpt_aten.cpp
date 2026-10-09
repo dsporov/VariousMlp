@@ -1,40 +1,39 @@
 // gpt_aten.cpp - the model on ATen, PyTorch's tensor library, with the backward
 // passes still written by hand.
 //
-// ATen is the layer of PyTorch underneath torch.nn and autograd: one tensor
-// type and a couple of thousand operations on it, each dispatched to whatever
-// device the tensor lives on. Written against it, the model reads almost line
-// for line like the video's Python - q.matmul(k.transpose(-2, -1)),
-// masked_fill, softmax - and runs on the CPU or, with a CUDA build of libtorch,
-// on the GPU, without a line of it changing.
+// ATen is the layer of PyTorch below torch.nn and autograd: one tensor type
+// and a few thousand operations on it, each sent to the device where the
+// tensor is stored. Written with ATen, the model looks almost line by line
+// like the video's Python (q.matmul(k.transpose(-2, -1)), masked_fill,
+// softmax). It runs on the CPU, or on the GPU with a CUDA build of libtorch,
+// without any change to the code.
 //
-// What it deliberately leaves alone is autograd. Every backward pass is
-// written out below exactly as gpt_model.h writes it, only as tensor
-// expressions instead of loops, so gpt_bench.h can check it against the
-// reference like any other candidate. Then section 4 turns autograd on, runs
-// the very same forward pass through it, and holds the hand-written gradients
-// up against what PyTorch derives by itself: a third opinion on every
-// derivative in the model, from something that never saw either of the other
-// two.
+// What it does not use, on purpose, is autograd. Every backward pass is
+// written by hand below, exactly as in gpt_model.h, but as tensor expressions
+// instead of loops. So gpt_bench.h can check it against the reference like any
+// other candidate. Then section 4 turns autograd on, runs the same forward
+// pass through it, and compares the hand-written gradients with the gradients
+// that PyTorch computes by itself. This is a third, independent check of every
+// derivative in the model.
 //
 // Needs libtorch, the C++ download from pytorch.org. Configure CMake with
-// -DCMAKE_PREFIX_PATH=<unpacked libtorch> and the gpt_aten target appears.
-// `gpt_aten cuda` runs on the GPU when libtorch was built with CUDA and
-// supports the card; recent CUDA builds of libtorch have been dropping older
-// cards such as the Pascal-generation GTX 1050 Ti, so check the release notes
-// before downloading one for it. The CPU build always works.
+// -DCMAKE_PREFIX_PATH=<unpacked libtorch>, and the gpt_aten target appears.
+// `gpt_aten cuda` runs on the GPU if libtorch was built with CUDA and supports
+// the card. Recent CUDA builds of libtorch no longer support some older cards,
+// such as the Pascal-generation GTX 1050 Ti. So check the release notes before
+// you download one for such a card. The CPU build always works.
 //
 // CMake builds this without OpenMP on purpose. libtorch brings its own OpenMP
-// runtime, and a second one in the same process - MSVC's libomp140 next to
-// its libiomp5, or clang's libomp next to its libgomp - either refuses to
-// start or fights it for the cores. So the reference in this program runs on
-// one thread, and its timings say so.
+// runtime. A second runtime in the same process (MSVC's libomp140 next to
+// libtorch's libiomp5, or clang's libomp next to libtorch's libgomp) fails to
+// start, or competes with the first one for the cores. So the reference in
+// this program runs on one thread, and its timings show that.
 
 #include <torch/torch.h>
 
-// c10's logging header defines a glog-style one-argument CHECK. Everything
-// below uses the two-argument one from check.h, which gpt_bench.h is about to
-// define in its place.
+// c10's logging header defines a one-argument CHECK in the style of glog.
+// Everything below uses the two-argument CHECK from check.h, which gpt_bench.h
+// includes next, so the first one is removed here.
 #ifdef CHECK
 #undef CHECK
 #endif
@@ -62,18 +61,19 @@ namespace {
 constexpr at::ScalarType kReal =
     std::is_same<real, float>::value ? at::kFloat : at::kDouble;
 
-// nn.LayerNorm's default, and gpt_model.h's.
+// The default of nn.LayerNorm, and the value gpt_model.h uses.
 constexpr double kLnEps = 1e-5;
 
-// gpt::AdamW's defaults, which are torch.optim.AdamW's.
+// The defaults of gpt::AdamW, which are the same as torch.optim.AdamW's.
 constexpr double kBeta1 = 0.9;
 constexpr double kBeta2 = 0.999;
 constexpr double kAdamEps = 1e-8;
 constexpr double kWeightDecay = 0.01;
 
-// Where each of a block's tensors sits in the parameter list. The order is the
-// one Gpt's constructor collects them in - it is what makes load() and
-// read_grads() line up with the reference - and load() checks it by size.
+// The position of each of a block's tensors in the parameter list. The order
+// is the one in which Gpt's constructor collects them. That order is what
+// makes load() and read_grads() match the reference, and load() checks it by
+// size.
 struct BlockSlots {
     int ln1_g, ln1_b;
     int wk, wq, wv, wp, bp;
@@ -87,10 +87,10 @@ struct LnSaved {
     at::Tensor invstd;
 };
 
-// What a block keeps between its forward and backward passes: the same list
-// gpt_model.h's layers keep, gathered in one place. q, k, v, p and pd are
-// (B, heads, T, *); everything else is (B, T, C) or (B, T, 4C). A mask is left
-// undefined when dropout did not run.
+// What a block keeps between its forward and backward passes: the same tensors
+// that the layers of gpt_model.h keep, collected in one place. q, k, v, p and
+// pd are (B, heads, T, *); everything else is (B, T, C) or (B, T, 4C). A mask
+// stays undefined if dropout did not run.
 struct BlockSaved {
     at::Tensor h1, q, k, v, p, pd, attn_mask, o, resid_mask;
     at::Tensor h2, r, ffwd_mask;
@@ -139,8 +139,8 @@ public:
             CHECK(static_cast<int64_t>(weights[i].data->size()) == p_[i].numel(),
                 weights[i].name << " has " << weights[i].data->size()
                 << " entries, this model's tensor " << p_[i].numel());
-            // from_blob wraps the reference's buffer without copying it;
-            // copy_ then moves the numbers onto the device and into storage
+            // from_blob wraps the reference's buffer without copying it.
+            // copy_ then copies the numbers to the device, into memory that
             // this model owns.
             p_[i].copy_(at::from_blob(weights[i].data->data(), p_[i].sizes(),
                 at::TensorOptions().dtype(kReal)));
@@ -207,7 +207,7 @@ public:
         return s;
     }
 
-    // Section 4's opinion: the same forward pass with autograd recording it,
+    // The check for section 4: the same forward pass, recorded by autograd,
     // and autograd's gradients for every parameter, in the usual order.
     std::vector<std::vector<real>> autograd_grads(const int* x, const int* y,
         int B, int T) {
@@ -252,7 +252,7 @@ private:
     }
 
     // (B, T, C) -> (B, heads, T, hs): head h is channels [h*hs, (h+1)*hs), the
-    // same split gpt_model.h's CausalSelfAttention makes.
+    // same division of channels as in CausalSelfAttention in gpt_model.h.
     at::Tensor split_heads(const at::Tensor& t) const {
         return t.reshape({ t.size(0), t.size(1), static_cast<int64_t>(cfg_.n_head),
             static_cast<int64_t>(hs_) }).transpose(1, 2);
@@ -263,7 +263,8 @@ private:
             static_cast<int64_t>(cfg_.n_embd) });
     }
 
-    // True above the diagonal: the future a position may not attend to.
+    // True above the diagonal: the future positions that a position may not
+    // attend to.
     const at::Tensor& future(int64_t T) {
         if (!future_.defined() || future_.size(0) != T) {
             future_ = at::ones({ T, T }, at::TensorOptions().dtype(at::kBool).device(device_))
@@ -272,9 +273,9 @@ private:
         return future_;
     }
 
-    // Inverted dropout, as gpt_model.h's Dropout: the survivors are scaled up
-    // by 1/(1-p) so that evaluation needs no correction. The mask carries the
-    // scale, so the backward pass is one multiply.
+    // Inverted dropout, as in gpt_model.h's Dropout: the kept elements are
+    // scaled up by 1/(1-p), so that evaluation needs no correction. The mask
+    // contains the scale factor, so the backward pass is one multiply.
     at::Tensor dropout(const at::Tensor& x, at::Tensor& mask) {
         if (!training_ || cfg_.dropout <= real(0)) {
             mask = at::Tensor();
@@ -297,7 +298,7 @@ private:
         return s.xhat * p_[static_cast<size_t>(g)] + p_[static_cast<size_t>(b)];
     }
 
-    // gpt_model.h's formula, a row at a time over the channels:
+    // The formula from gpt_model.h, for each row, over the channels:
     //   dx = invstd * (dxhat - mean(dxhat) - xhat * mean(dxhat * xhat))
     at::Tensor layer_norm_backward(const at::Tensor& dout, int g, int b,
         const LnSaved& s) {
@@ -308,9 +309,9 @@ private:
             - s.xhat * (dxhat * s.xhat).mean({ -1 }, true));
     }
 
-    // out = x W (+ b) over every row: dW += x^T dout, db the column sums,
-    // dx = dout W^T. b < 0 for the three attention projections, which have no
-    // bias.
+    // The backward pass of out = x W (+ b) over every row: dW += x^T dout,
+    // db += the column sums of dout, and dx = dout W^T. b < 0 for the three
+    // attention projections, which have no bias.
     at::Tensor linear_backward(const at::Tensor& x, const at::Tensor& dout, int w,
         int b) {
         const at::Tensor x2 = x.reshape({ -1, x.size(-1) });
@@ -331,7 +332,7 @@ private:
         sv.k = split_heads(sv.h1.matmul(p_[static_cast<size_t>(s.wk)]));
         sv.v = split_heads(sv.h1.matmul(p_[static_cast<size_t>(s.wv)]));
 
-        // wei = q @ k.transpose(-2, -1) * hs**-0.5, masked, softmaxed
+        // wei = q @ k.transpose(-2, -1) * hs**-0.5, then the mask and softmax
         const at::Tensor scores = sv.q.matmul(sv.k.transpose(-2, -1)) * scale();
         sv.p = at::softmax(scores.masked_fill(future(x.size(1)),
             -std::numeric_limits<double>::infinity()), -1);
@@ -350,9 +351,10 @@ private:
         return mid + dropout(f2, sv.ffwd_mask);
     }
 
-    // The residual adds fan out in the forward pass, so the gradient arriving
-    // at a block's output reaches mid both through the feedforward branch and
-    // straight along the skip, and mid's reaches x the same way.
+    // In the forward pass, each residual add uses its input twice. So in the
+    // backward pass, the gradient at a block's output reaches mid in two
+    // ways: through the feedforward branch, and directly through the skip
+    // connection. The gradient at mid reaches x in the same two ways.
     at::Tensor block_backward(const BlockSlots& s, const BlockSaved& sv,
         const at::Tensor& dout) {
         // out = mid + drop(relu(h2 W1 + b1) W2 + b2)
@@ -368,13 +370,14 @@ private:
         const at::Tensor dv = sv.pd.transpose(-2, -1).matmul(dO);
         const at::Tensor dp = undrop(dO.matmul(sv.v.transpose(-2, -1)), sv.attn_mask);
 
-        // The softmax, a row at a time: ds = p * (dp - sum(p * dp)). p is
-        // exactly zero above the diagonal, so the future gets nothing.
+        // The softmax, for each row: ds = p * (dp - sum(p * dp)). p is exactly
+        // zero above the diagonal, so future positions get no gradient.
         const at::Tensor ds = sv.p * (dp - (sv.p * dp).sum({ -1 }, true));
         const at::Tensor dq = ds.matmul(sv.k) * scale();
         const at::Tensor dk = ds.transpose(-2, -1).matmul(sv.q) * scale();
 
-        // h1 fed all three projections, so all three gradients come back to it.
+        // h1 was the input of all three projections, so its gradient is the
+        // sum of all three.
         const at::Tensor dh1 = linear_backward(sv.h1, merge_heads(dq), s.wq, -1)
             + linear_backward(sv.h1, merge_heads(dk), s.wk, -1)
             + linear_backward(sv.h1, merge_heads(dv), s.wv, -1);
@@ -388,9 +391,9 @@ private:
     //   logits = self.lm_head(x)
     //   loss = F.cross_entropy(logits.view(B*T, C), targets.view(B*T))
     //
-    // Returns the loss as a tensor, so that with autograd on it can be
-    // backpropagated through; everything the hand-written backward pass needs
-    // is kept on the way.
+    // Returns the loss as a tensor, so that autograd, when it is on, can
+    // backpropagate through it. Everything that the hand-written backward
+    // pass needs is saved along the way.
     at::Tensor forward(const int* x, const int* y, int B, int T) {
         CHECK(T > 0 && T <= cfg_.block, "a window of " << T
             << " positions, but the position table has " << cfg_.block << " rows");
@@ -415,8 +418,8 @@ private:
         const int64_t N = logp_.size(0);
         const int64_t C = cfg_.n_embd;
 
-        // Cross entropy's gradient is softmax minus the one-hot target, over
-        // the N predictions the loss averaged.
+        // The gradient of cross entropy is softmax minus the one-hot target,
+        // divided by the N predictions that the loss averages over.
         const at::Tensor dlogits = ((logp_.exp()
             - at::one_hot(targets_, vocab_).to(kReal)) / static_cast<double>(N))
             .reshape({ hf_.size(0), hf_.size(1), static_cast<int64_t>(vocab_) });
@@ -426,9 +429,10 @@ private:
             d = block_backward(blocks_[i], saved_[i], d);
         }
 
-        // The embedding tables scatter back by index. index_add_ sums the
-        // repeats - a character used eight times in the batch contributes
-        // eight times - and every window uses the same position rows.
+        // The gradients of the embedding tables are added back by index.
+        // index_add_ sums repeated rows: a character used eight times in the
+        // batch contributes eight times. Every window uses the same rows of
+        // the position table.
         g_[static_cast<size_t>(wte_)].index_add_(0, idx_.reshape({ -1 }),
             d.reshape({ -1, C }));
         g_[static_cast<size_t>(wpe_)].slice(0, 0, d.size(1)).add_(d.sum({ 0 }));
@@ -517,8 +521,8 @@ void autograd_opinion(const Data& d, at::Device device) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    // A CHECK that fires, or an error out of ATen, is reported and ends the
-    // program rather than being left to terminate().
+    // A failed CHECK, or an error from ATen, is reported here and ends the
+    // program. Without this, it would reach terminate().
     try {
         at::Device device(at::kCPU);
         if (argc > 1 && std::string(argv[1]) == "cuda") {
@@ -529,8 +533,8 @@ int main(int argc, char** argv) {
                 printf("no CUDA device this libtorch can use - staying on the CPU\n");
             }
         }
-        // Section 3's dropout masks come from torch's generator rather than
-        // the reference's, so they get a seed of their own.
+        // The dropout masks in section 3 come from torch's random generator,
+        // not from the reference's, so torch's generator gets its own seed.
         torch::manual_seed(1337);
 
         printf("gpt_aten: the model on ATen tensors, backward passes by hand\n");
