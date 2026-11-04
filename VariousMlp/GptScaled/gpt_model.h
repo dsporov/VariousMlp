@@ -191,18 +191,34 @@ constexpr long long kMinParallelWork = 16384;
 // half a letter at a time.
 constexpr const char* kCorpus = "input.txt";
 
-struct Data {
-    std::vector<int> train;
-    std::vector<int> val;
+// The vocabulary without the text it came from. Data below holds one, and
+// every checkpoint holds one too. So a program that only samples from a saved
+// model reads the vocabulary from the checkpoint and does not need the corpus.
+// gpt_chat.cpp works this way.
+struct Vocab {
     std::vector<char> itos;
     int stoi[256];
     int vocab = 0;
 
-    // The directory that input.txt was loaded from. Checkpoints are saved
-    // there too. A run from Visual Studio and a run of the exe on its own have
-    // different working directories, and this way each finds the other's
-    // checkpoints.
-    std::string dir;
+    // Builds both maps from a list of characters. The list must be in byte
+    // order without repeats, which is what the scan of a corpus produces. The
+    // checkpoint reader tests this itself, so a damaged file is rejected
+    // before it gets here.
+    void assign(const std::vector<char>& chars) {
+        for (size_t i = 1; i < chars.size(); ++i) {
+            CHECK(static_cast<unsigned char>(chars[i - 1])
+                < static_cast<unsigned char>(chars[i]),
+                "the vocabulary is not in byte order at entry " << i);
+        }
+        for (int& s : stoi) {
+            s = -1;
+        }
+        itos = chars;
+        vocab = static_cast<int>(chars.size());
+        for (int i = 0; i < vocab; ++i) {
+            stoi[static_cast<unsigned char>(chars[static_cast<size_t>(i)])] = i;
+        }
+    }
 
     char decode(int i) const {
         CHECK(i >= 0 && i < vocab, "token " << i << " is outside the vocabulary");
@@ -217,6 +233,33 @@ struct Data {
         }
         return s;
     }
+};
+
+struct Data : Vocab {
+    std::vector<int> train;
+    std::vector<int> val;
+
+    // The directory that input.txt was loaded from. Checkpoints are saved
+    // there too. A run from Visual Studio and a run of the exe on its own have
+    // different working directories, and this way each finds the other's
+    // checkpoints.
+    std::string dir;
+};
+
+// The data is searched for relative to a few likely working directories.
+// Visual Studio runs with cwd = $(ProjectDir), a run of the exe on its own has
+// cwd = x64\Debug, and running from the repo root is the other common case. A
+// CMake build runs from somewhere in its build tree, which none of these paths
+// reach. So CMake defines this directory explicitly, and it is tried first.
+// gpt_chat.cpp looks for checkpoints in the same directories.
+inline constexpr const char* kDataDirs[] = {
+#ifdef VARIOUSMLP_DATA_DIR
+    VARIOUSMLP_DATA_DIR "/",
+#endif
+    "makemore/",
+    "",
+    "VariousMlp/makemore/",
+    "../../VariousMlp/makemore/",
 };
 
 // The vocabulary can contain any byte, so a byte outside printable ASCII is
@@ -238,24 +281,8 @@ inline std::string printable(char c) {
 }
 
 inline bool load_corpus(Data& d) {
-    // The data is searched for relative to a few likely working directories.
-    // Visual Studio runs with cwd = $(ProjectDir), a run of the exe on its own
-    // has cwd = x64\Debug, and running from the repo root is the other common
-    // case. A CMake build runs from somewhere in its build tree, which none of
-    // these paths reach. So CMake defines this directory explicitly, and it is
-    // tried first.
-    static const char* kDirs[] = {
-#ifdef VARIOUSMLP_DATA_DIR
-        VARIOUSMLP_DATA_DIR "/",
-#endif
-        "makemore/",
-        "",
-        "VariousMlp/makemore/",
-        "../../VariousMlp/makemore/",
-    };
-
     std::string text;
-    for (const char* dir : kDirs) {
+    for (const char* dir : kDataDirs) {
         const std::string path = std::string(dir) + kCorpus;
         std::ifstream f(path, std::ios::binary);
         if (!f) {
@@ -277,19 +304,17 @@ inline bool load_corpus(Data& d) {
     // and change the vocabulary and every loss below. So '\r' is removed.
     text.erase(std::remove(text.begin(), text.end(), '\r'), text.end());
 
-    for (int& s : d.stoi) {
-        s = -1;
-    }
     std::vector<bool> present(256, false);
     for (char c : text) {
         present[static_cast<unsigned char>(c)] = true;
     }
+    std::vector<char> chars;
     for (int c = 0; c < 256; ++c) {
         if (present[static_cast<size_t>(c)]) {
-            d.stoi[c] = d.vocab++;
-            d.itos.push_back(static_cast<char>(c));
+            chars.push_back(static_cast<char>(c));
         }
     }
+    d.assign(chars);
 
     // Python: data = torch.tensor(encode(text), dtype=torch.long)
     //         n = int(0.9 * len(data))
@@ -1741,7 +1766,9 @@ private:
 // was restarted. The format describes itself, on purpose. The header holds the
 // shape of the model and the size of its scalar type, and every tensor holds
 // its own name and length. So a checkpoint for a model of a different shape is
-// rejected, instead of being read as meaningless numbers.
+// rejected, instead of being read as meaningless numbers. The header also holds
+// the vocabulary. So a checkpoint can be used without the corpus it was
+// trained on, and gpt_chat.cpp can open any checkpoint on its own.
 //
 // A missing or outdated checkpoint is not an error; it only means that the
 // model has to be trained. So these functions report and return false instead
@@ -1754,7 +1781,9 @@ private:
 // sizeof(real) in the header and in the file name stops a float build from
 // reading a double build's file.
 
-constexpr char kCheckpointMagic[8] = { 'V', 'M', 'L', 'P', 'G', 'P', 'T', '2' };
+// The last byte is the version of the format. Version 3 added the vocabulary
+// to the header.
+constexpr char kCheckpointMagic[8] = { 'V', 'M', 'L', 'P', 'G', 'P', 'T', '3' };
 
 // FNV-1a over the vocabulary and the corpus length. The header already checks
 // the shape of the model, but the same shape does not mean the same corpus.
@@ -1810,6 +1839,7 @@ inline bool save_params(const std::vector<Param>& params, const Config& cfg,
     write_pod(f, static_cast<std::int32_t>(sizeof(real)));
     write_pod(f, corpus_fingerprint(d));
     write_pod(f, static_cast<std::int32_t>(d.vocab));
+    f.write(d.itos.data(), static_cast<std::streamsize>(d.itos.size()));
     write_pod(f, static_cast<std::int32_t>(cfg.n_embd));
     write_pod(f, static_cast<std::int32_t>(cfg.n_head));
     write_pod(f, static_cast<std::int32_t>(cfg.n_layer));
@@ -1826,6 +1856,118 @@ inline bool save_params(const std::vector<Param>& params, const Config& cfg,
     return static_cast<bool>(f);
 }
 
+// What the header of a checkpoint holds. Only the four fields of Config that
+// change the shape of the weights are stored. Batch, dropout and the learning
+// rate are training settings. So a model built from the header gets the
+// values for sampling: batch 1, no dropout.
+struct CheckpointHeader {
+    Config cfg{ 0, 0, 0, 0, 1, real(0), real(0) };
+    Vocab vocab;
+    std::uint64_t fingerprint = 0;
+    std::int32_t tensors = 0;
+};
+
+// Reads the header and leaves f at the first tensor. Returns nullptr if the
+// header is valid, and otherwise the reason why it is not. The reason is
+// returned instead of printed, because gpt_chat.cpp shows it in its list of
+// checkpoints.
+inline const char* read_checkpoint_header(std::istream& f, CheckpointHeader& h) {
+    constexpr size_t kVersionByte = sizeof(kCheckpointMagic) - 1;
+    char magic[sizeof(kCheckpointMagic)];
+    if (!f.read(magic, sizeof(magic))
+        || std::memcmp(magic, kCheckpointMagic, kVersionByte) != 0) {
+        return "not a checkpoint written by this file";
+    }
+    if (magic[kVersionByte] != kCheckpointMagic[kVersionByte]) {
+        return "it is in another version of the format";
+    }
+
+    std::int32_t scalar = 0, v = 0;
+    if (!read_pod(f, scalar) || !read_pod(f, h.fingerprint) || !read_pod(f, v)) {
+        return "the header is truncated";
+    }
+    if (scalar != static_cast<std::int32_t>(sizeof(real))) {
+        return "it was written with a different scalar type";
+    }
+    if (v <= 0 || v > 256) {
+        return "its vocabulary size is malformed";
+    }
+    std::vector<char> chars(static_cast<size_t>(v));
+    if (!f.read(chars.data(), v)) {
+        return "the header is truncated";
+    }
+    for (size_t i = 1; i < chars.size(); ++i) {
+        if (static_cast<unsigned char>(chars[i - 1])
+            >= static_cast<unsigned char>(chars[i])) {
+            return "its vocabulary is not in byte order";
+        }
+    }
+    h.vocab.assign(chars);
+
+    std::int32_t embd = 0, head = 0, layer = 0, block = 0;
+    if (!read_pod(f, embd) || !read_pod(f, head) || !read_pod(f, layer)
+        || !read_pod(f, block) || !read_pod(f, h.tensors)) {
+        return "the header is truncated";
+    }
+    // gpt_chat.cpp builds a model from these values. A shape that no model
+    // can have is rejected here, so that it does not reach the CHECKs in the
+    // Gpt constructor.
+    if (embd <= 0 || head <= 0 || embd % head != 0 || layer < 0 || block <= 0) {
+        return "its model shape is malformed";
+    }
+    h.cfg.n_embd = embd;
+    h.cfg.n_head = head;
+    h.cfg.n_layer = layer;
+    h.cfg.block = block;
+    return nullptr;
+}
+
+// Reads the tensors that follow the header into params. Returns nullptr on
+// success, and otherwise the reason for the failure.
+inline const char* read_tensors(std::istream& f, std::int32_t count,
+    std::vector<Param>& params) {
+    if (count != static_cast<std::int32_t>(params.size())) {
+        return "it holds a different number of tensors";
+    }
+
+    // Read into a staging buffer first. If the file turns out to be truncated
+    // in the middle, the model should stay as it was. It should not end up
+    // with half of its weights from one model and half from another. The cost
+    // is holding the parameters twice, which for the scaled-up model is 86MB.
+    std::vector<std::vector<real>> staged(params.size());
+    for (size_t i = 0; i < params.size(); ++i) {
+        std::int32_t len = 0;
+        if (!read_pod(f, len) || len < 0 || len > 256) {
+            return "a tensor name is malformed";
+        }
+        std::string name(static_cast<size_t>(len), '\0');
+        if (len > 0 && !f.read(&name[0], len)) {
+            return "a tensor name is truncated";
+        }
+        std::int64_t n = 0;
+        if (!read_pod(f, n) || n < 0) {
+            return "a tensor length is malformed";
+        }
+        if (name != params[i].name
+            || static_cast<size_t>(n) != params[i].data->size()) {
+            return "its tensors do not line up with this model's";
+        }
+        staged[i].resize(static_cast<size_t>(n));
+        if (n > 0 && !f.read(reinterpret_cast<char*>(staged[i].data()),
+            static_cast<std::streamsize>(n * static_cast<std::int64_t>(sizeof(real))))) {
+            return "it is truncated";
+        }
+    }
+
+    for (size_t i = 0; i < params.size(); ++i) {
+        *params[i].data = staged[i];
+    }
+    return nullptr;
+}
+
+// Loads a checkpoint into a model that training built. Training needs the
+// corpus anyway, so the fingerprint is checked against it: a model must not
+// resume on text it was not trained on.
 inline bool load_params(std::vector<Param>& params, const Config& cfg, const Data& d,
     const std::string& path) {
     std::ifstream f(path, std::ios::binary);
@@ -1838,67 +1980,54 @@ inline bool load_params(std::vector<Param>& params, const Config& cfg, const Dat
         return false;
     };
 
-    char magic[sizeof(kCheckpointMagic)];
-    if (!f.read(magic, sizeof(magic))
-        || std::memcmp(magic, kCheckpointMagic, sizeof(magic)) != 0) {
-        return reject("not a checkpoint written by this file");
+    CheckpointHeader h;
+    if (const char* why = read_checkpoint_header(f, h)) {
+        return reject(why);
     }
-
-    std::int32_t scalar = 0, v = 0, embd = 0, head = 0, layer = 0, block = 0;
-    std::int32_t count = 0;
-    std::uint64_t fingerprint = 0;
-    if (!read_pod(f, scalar) || !read_pod(f, fingerprint) || !read_pod(f, v)
-        || !read_pod(f, embd) || !read_pod(f, head) || !read_pod(f, layer)
-        || !read_pod(f, block) || !read_pod(f, count)) {
-        return reject("the header is truncated");
-    }
-    if (scalar != static_cast<std::int32_t>(sizeof(real))) {
-        return reject("it was written with a different scalar type");
-    }
-    if (fingerprint != corpus_fingerprint(d)) {
+    if (h.fingerprint != corpus_fingerprint(d)) {
         return reject("it was trained on a different corpus");
     }
-    if (v != d.vocab || embd != cfg.n_embd || head != cfg.n_head
-        || layer != cfg.n_layer || block != cfg.block) {
+    if (h.vocab.vocab != d.vocab || h.cfg.n_embd != cfg.n_embd
+        || h.cfg.n_head != cfg.n_head || h.cfg.n_layer != cfg.n_layer
+        || h.cfg.block != cfg.block) {
         return reject("it was written for a differently shaped model");
     }
-    if (count != static_cast<std::int32_t>(params.size())) {
-        return reject("it holds a different number of tensors");
-    }
-
-    // Read into a staging buffer first. If the file turns out to be truncated
-    // in the middle, the model should stay as it was. It should not end up
-    // with half of its weights from one model and half from another. The cost
-    // is holding the parameters twice, which for the scaled-up model is 86MB.
-    std::vector<std::vector<real>> staged(params.size());
-    for (size_t i = 0; i < params.size(); ++i) {
-        std::int32_t len = 0;
-        if (!read_pod(f, len) || len < 0 || len > 256) {
-            return reject("a tensor name is malformed");
-        }
-        std::string name(static_cast<size_t>(len), '\0');
-        if (len > 0 && !f.read(&name[0], len)) {
-            return reject("a tensor name is truncated");
-        }
-        std::int64_t n = 0;
-        if (!read_pod(f, n) || n < 0) {
-            return reject("a tensor length is malformed");
-        }
-        if (name != params[i].name
-            || static_cast<size_t>(n) != params[i].data->size()) {
-            return reject("its tensors do not line up with this model's");
-        }
-        staged[i].resize(static_cast<size_t>(n));
-        if (n > 0 && !f.read(reinterpret_cast<char*>(staged[i].data()),
-            static_cast<std::streamsize>(n * static_cast<std::int64_t>(sizeof(real))))) {
-            return reject("it is truncated");
-        }
-    }
-
-    for (size_t i = 0; i < params.size(); ++i) {
-        *params[i].data = staged[i];
+    if (const char* why = read_tensors(f, h.tensors, params)) {
+        return reject(why);
     }
     return true;
+}
+
+// Builds a model from a checkpoint alone, without the corpus. The shape and
+// the vocabulary come from the header, so this opens any checkpoint that
+// save_params wrote. gpt_chat.cpp uses it. The fingerprint is not checked,
+// because there is no corpus to compare it with. The token ids keep their
+// meaning because the vocabulary is the one saved with the weights.
+//
+// Returns an empty pointer, after a report, if the file cannot be used.
+// Otherwise vocab receives the vocabulary from the file.
+inline std::unique_ptr<Gpt> load_model(const std::string& path, Vocab& vocab) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) {
+        printf("  could not open %s\n", path.c_str());
+        return std::unique_ptr<Gpt>();
+    }
+
+    CheckpointHeader h;
+    const char* why = read_checkpoint_header(f, h);
+    if (why == nullptr) {
+        // The file overwrites the random initial weights, so this seed has no
+        // effect.
+        std::mt19937 unused(1337);
+        std::unique_ptr<Gpt> model(new Gpt(h.cfg, h.vocab.vocab, unused));
+        why = read_tensors(f, h.tensors, model->params());
+        if (why == nullptr) {
+            vocab = h.vocab;
+            return model;
+        }
+    }
+    printf("  ignoring %s: %s\n", path.c_str(), why);
+    return std::unique_ptr<Gpt>();
 }
 
 // ---------------------------------------------------------------------------

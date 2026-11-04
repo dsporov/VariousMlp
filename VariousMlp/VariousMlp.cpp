@@ -7,7 +7,7 @@ void test_makemore();
 void test_makemore_mlp();
 void test_makemore_batchnorm();
 void test_gpt();
-void test_gpt_chat();
+void test_gpt_chat(const std::string& checkpoint);
 
 int main(int argc, char** argv)
 {
@@ -17,10 +17,11 @@ int main(int argc, char** argv)
     try {
         // The walkthroughs take minutes and end by training a model. The
         // prompt that uses this model should start immediately, and
-        // `VariousMlp.exe chat` goes directly to it. In Visual Studio, set this
-        // under Debugging -> Command Arguments.
+        // `VariousMlp.exe chat` goes directly to it, and
+        // `VariousMlp.exe chat <file>` also names the checkpoint to load. In
+        // Visual Studio, set this under Debugging -> Command Arguments.
         if (argc > 1 && std::string(argv[1]) == "chat") {
-            test_gpt_chat();
+            test_gpt_chat(argc > 2 ? argv[2] : "");
             return 0;
         }
 
