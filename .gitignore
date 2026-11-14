@@ -4,3 +4,4 @@ x64
 *.ckpt
 out
 CMakeUserPresets.json
+VariousMlp/makemore/gpt_*.csv

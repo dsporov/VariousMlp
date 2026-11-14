@@ -1,9 +1,7 @@
-// GptScaled's own copy of makemore/gpt_cuda.cu, copied at commit 512eaaa.
-// Later changes went into both copies, so a diff between the two shows only
-// this note. gpt_scaled compiles only the files in this directory, which keeps
-// it independent of makemore/: a change to one copy does not reach the other.
-// Where the comments below mention other files, they mean the files in
-// makemore/.
+// GptScaled's own copy of makemore/gpt_cuda.cu, copied at commit 512eaaa. Later changes went into both copies, with one exception.
+// Here the scale factor for attention's scores comes from Shape::score_scale. It is not computed from the head size. gpt_scaled
+// compiles only the files in this directory, which keeps it independent of makemore/: a change to one copy does not reach the other.
+// Where the comments below mention other files, they mean the files in makemore/.
 //
 // gpt_cuda.cu - the model on the GPU, with every forward and backward pass
 // written as kernels.
@@ -746,6 +744,8 @@ struct Model::Impl {
         CHECK(s.block > 0 && s.vocab > 0 && s.n_layer >= 0, "a model with context "
             << s.block << ", vocabulary " << s.vocab << " and " << s.n_layer << " blocks");
         CHECK(s.dropout >= 0.0f && s.dropout < 1.0f, "dropout probability " << s.dropout);
+        // A Shape that leaves out the last field gets zero, and a zero scale would give uniform attention without any error.
+        CHECK(s.score_scale > 0.0f, "attention score scale " << s.score_scale);
         CUDA_CHECK(cudaSetDevice(0));
         hs = s.n_embd / s.n_head;
 
@@ -970,15 +970,15 @@ struct Model::Impl {
         const size_t nc = static_cast<size_t>(n) * C;
         const int att_rows = B * s.n_head * T;
         const size_t att = static_cast<size_t>(att_rows) * T;
-        const float scale = 1.0f / std::sqrt(static_cast<float>(hs));
+        const float scale = s.score_scale;
 
         layernorm(x, sl.ln1_g, sl.ln1_b, a.ln1_xhat.get(), a.ln1_inv.get(), a.h1.get(), n);
         gemm(false, false, n, C, C, 1.0f, a.h1.get(), C, P(sl.wq), C, a.q.get(), C, false);
         gemm(false, false, n, C, C, 1.0f, a.h1.get(), C, P(sl.wk), C, a.k.get(), C, false);
         gemm(false, false, n, C, C, 1.0f, a.h1.get(), C, P(sl.wv), C, a.v.get(), C, false);
 
-        // wei = q @ k^T * hs**-0.5 for every (batch, head) in one launch, then
-        // the mask and the softmax in place.
+        // wei = q @ k^T * score_scale for every (batch, head) in one launch, then the mask and the softmax in place. The published
+        // gpt.py's scale is hs**-0.5, and the video's is n_embd**-0.5.
         gemm(false, true, T, T, hs, scale, a.q.get(), C, a.k.get(), C, a.p.get(), T,
             false, nullptr, per_head(head_slice(), head_slice(), head_square()));
         causal_softmax_forward<<<blocks_for(static_cast<size_t>(att_rows), kRowsPerBlock),
@@ -1024,7 +1024,7 @@ struct Model::Impl {
         const size_t nc4 = static_cast<size_t>(n) * C4;
         const int att_rows = B * s.n_head * T;
         const size_t att = static_cast<size_t>(att_rows) * T;
-        const float scale = 1.0f / std::sqrt(static_cast<float>(hs));
+        const float scale = s.score_scale;
 
         // out = mid + drop(relu(h2 W1 + b1) W2 + b2)
         const float* df2 = undrop(dout, a.ffwd_mask, d_tmp, nc);

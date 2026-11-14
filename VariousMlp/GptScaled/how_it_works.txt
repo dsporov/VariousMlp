@@ -50,14 +50,24 @@ A Block is pre-norm, with two residual adds (row vectors, so x W):
 Attention runs all six heads out of one 384 x 384 projection each for Q, K
 and V (no bias). Head h owns channels [64h, 64h + 64) of each:
 
-    scores = Q_h K_h^T / sqrt(64)           T x T
+    scores = Q_h K_h^T / sqrt(64)           T x T   (or / sqrt(384), below)
     causal mask: position t sees only 0..t (the future gets zero probability)
     P      = softmax of each row, then dropout
     out_h  = P V_h                          T x 64
     the six out_h side by side are the 384 channels that Wp projects
 
-Initial weights are normal(0, 0.02) everywhere, and biases are zero, as in
-the video's _init_weights.
+By default, the initial weights are normal(0, 0.02) everywhere, and biases are zero, as in the published gpt.py's _init_weights.
+
+The code that the video runs differs from the published gpt.py in exactly two places, both changed in the repository after the video:
+
+    score scale   video: / sqrt(n_embd) = / sqrt(384)
+                  gpt.py since 2023-01-25: / sqrt(head size) = / sqrt(64)
+    init          video: PyTorch's defaults. Linear weights and biases uniform in +-1/sqrt(fan_in), embeddings normal(0, 1)
+                  gpt.py since 2023-02-06: _init_weights, as above
+
+The video's 1.48 comes from the video's settings. Config::score_scale and Config::init choose between the two, and gpt_scaled.cpp's
+kScoreScale and kInit set them. The checkpoint name gets a tag for each of the video's settings. With the video's score scale, the
+checkpoint is in format version 4, which makemore/'s gpt_model.h and the chat tool cannot read.
 
 Parameters, 10,788,929 in all (the video prints 10.788929 M):
 
@@ -165,9 +175,11 @@ number of windows.
        the scalar reference from the same weights. The loss has to agree to
        1e-4, and every gradient tensor to 1e-3 of its largest entry. This
        check shows that the k/B scale factor is correct.
-    2. Train 5000 steps, or load the checkpoint if one is beside input.txt.
-       It uses gpt_model.h's format and name, so gpt.cpp's scale-up branch
-       and the chat tool find it too. Delete it to train again.
+    2. Train 5000 steps, or load the checkpoint if one is beside input.txt. With the default settings, it uses gpt_model.h's format
+       and name, so gpt.cpp's scale-up branch and the chat tool find it too. Delete it to train again. While training, the curve also
+       goes to a CSV file with the checkpoint's name. Each evaluation prints the mean batch loss of the GPU's windows and of the CPU's
+       windows since the previous one. At the end, a table shows all evaluations, and a check requires the two sides' mean batch
+       losses to agree to 0.01. If one side's dropout dropped less, that side's batch loss would be lower.
     3. Print where a step's time went: GPU half, CPU half, combining the
        gradients, AdamW plus the upload.
     4. Sample 1000 characters on the CPU, because gpt_cuda.h returns losses
@@ -187,6 +199,10 @@ of 15) and 19 on the CPU, plus 39 minutes of evaluations. Validation loss
 was lowest at step 2500 (1.4764), then rose to 1.5615 by the end, while the
 training loss kept falling. That is overfitting, so the 1.48 check failed.
 That run was made before the fix to the GPU's dropout seeds (see 3.6).
+
+The run of 2026-11-10, with the dropout fix, gave the same result: train 0.8781 and validation 1.5507 at step 4999, after 1.5223 at
+step 4500. The earlier evaluations were lost from the console. So the dropout seeds were not the cause. It ran at about 1623 ms a
+step (682 GFLOP/s) with the same 45/19 division, 174 minutes in all. Both runs used the published gpt.py's score scale and init.
 
 
 2. The vectorised CPU multiply (gpt_gemm.h), in a nutshell

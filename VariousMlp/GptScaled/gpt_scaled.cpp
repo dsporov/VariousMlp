@@ -41,13 +41,13 @@
 // after every step. The GPU's share of each batch moves toward the point where
 // both sides finish at the same time.
 //
-// This directory is a separate project. check.h, gpt_gemm.h, gpt_model.h,
-// gpt_cuda.h and gpt_cuda.cu are copies of the files in makemore/, and nothing
-// here includes a file from makemore/. The only contact with the rest of the
-// repository is through files on disk. The program reads makemore/input.txt.
-// It saves the trained weights next to that file, in gpt_model.h's checkpoint
-// format and under gpt_model.h's file name for this shape. gpt.cpp's scale-up
-// branch looks for that file, and the chat tool can read it.
+// This directory is a separate project. check.h, gpt_gemm.h, gpt_model.h, gpt_cuda.h and gpt_cuda.cu are copies of the files in
+// makemore/, and nothing here includes a file from makemore/. The only contact with the rest of the repository is through files on
+// disk. The program reads makemore/input.txt. It saves the trained weights next to that file, in gpt_model.h's checkpoint format and
+// under gpt_model.h's file name for this shape. With the default settings, gpt.cpp's scale-up branch looks for that file, and the
+// chat tool can read it. kScoreScale below explains why the settings may differ from the defaults, and what that changes in the file.
+//
+// The training curve also goes into a CSV file with the checkpoint's name.
 //
 // Expect a run of a few hours: 5000 steps of 1.1 TFLOP each, plus the video's
 // eleven evaluations of 200 batches on each of the training and validation
@@ -61,6 +61,7 @@
 #include <cmath>
 #include <cstdio>
 #include <exception>
+#include <fstream>
 #include <future>
 #include <iostream>
 #include <random>
@@ -83,6 +84,18 @@ namespace {
 // The video's eval_interval. Its max_iters and eval_iters are kIters and
 // kEvalIters in gpt_model.h, and the model's shape is the kBig constants.
 constexpr int kEvalEvery = 500;
+
+// The code that the video runs differs from the published gpt.py in two places: the scale factor for attention's scores, and the
+// initial weights. The comments above ScoreScale and Init in gpt_model.h explain both. By default, gpt_model.h follows the published
+// gpt.py. The first two runs of this program did that, and both overfit. Validation loss was lowest at 1.476 at step 2500 in the
+// first run. It ended at 1.56 and 1.55, against the video's 1.48. That number comes from the video's code, so these settings
+// reproduce that code.
+//
+// To train the published gpt.py instead, use ScoreScale::kHeadSize and Init::kNormal. Each setting is part of the checkpoint's name,
+// so every combination trains and saves its own model. With the video's score scale, the checkpoint is in format version 4.
+// makemore/'s gpt_model.h reads only version 3, so the chat tool cannot open that file.
+constexpr ScoreScale kScoreScale = ScoreScale::kEmbed;
+constexpr Init kInit = Init::kTorchDefault;
 
 // Evaluations are 500 steps apart, which at this size means several minutes.
 // So a progress line is printed more often than that.
@@ -130,9 +143,10 @@ constexpr int kCheckChunk = 2;
 constexpr double kGradTolerance = 1e-3;
 constexpr double kLossTolerance = 1e-4;
 
-// An untrained model gives every character about the same probability, so its
-// loss starts near ln(vocab). It starts a little above that, because weights
-// with a standard deviation of 0.02 already make the logits uneven.
+// An untrained model gives every character about the same probability, so its loss starts near ln(vocab). It starts a little above
+// that, because the initial weights already make the logits uneven. The excess is about half the variance of the logits. After the
+// final layer norm, that variance is n_embd times the variance of lm_head's weights. That gives about 0.08 for Init::kNormal and
+// about 0.17 for Init::kTorchDefault.
 constexpr double kStartTolerance = 0.2;
 
 // The video's final validation loss, as recorded in gpt_model.h. This run has
@@ -140,6 +154,12 @@ constexpr double kStartTolerance = 0.2;
 // close to this value, not equal to it.
 constexpr double kVideoVal = 1.48;
 constexpr double kVideoValTolerance = 0.05;
+
+// Both sides draw their windows from the same training data, with the same weights. So over the whole run, the mean batch loss of
+// the GPU's windows and of the CPU's windows should agree. The batch loss is measured with dropout. If one side's dropout dropped
+// less, that side's loss would be lower, by up to the gap between the batch loss and the evaluated training loss, which was about
+// 0.15 at the end of the earlier runs. Over 5000 steps, random variation should stay near 0.001.
+constexpr double kSidesTolerance = 0.01;
 
 // The number of characters to sample from the trained model. Sampling runs on
 // the CPU, because gpt_cuda.h returns losses and never logits.
@@ -252,8 +272,8 @@ struct StepTimes {
 class SplitModel {
 public:
     SplitModel(const Config& cfg, int vocab, int gpu_chunk, std::mt19937& g)
-        : gpu_(gpt_cuda::Shape{ cfg.n_embd, cfg.n_head, cfg.n_layer, cfg.block,
-            vocab, static_cast<float>(cfg.dropout) }),
+        : gpu_(gpt_cuda::Shape{ cfg.n_embd, cfg.n_head, cfg.n_layer, cfg.block, vocab, static_cast<float>(cfg.dropout),
+            static_cast<float>(score_scale_factor(cfg.score_scale, cfg.n_embd, cfg.n_embd / cfg.n_head)) }),
           cpu_(cfg, vocab, g),
           opt_(cpu_.params(), cfg.lr),
           gpu_chunk_(gpu_chunk),
@@ -345,6 +365,8 @@ public:
         const Division div = division(B);
         const int n = div.gpu_windows();
         const auto [gpu, cpu] = both_halves(x, y, div, B, T, true);
+        last_gpu_loss_ = gpu.loss;
+        last_cpu_loss_ = cpu.loss;
 
         const Clock::time_point start = Clock::now();
         combine(div, B);
@@ -395,6 +417,16 @@ public:
 
     const StepTimes& times() const {
         return times_;
+    }
+
+    // The mean loss over the GPU's windows and over the CPU's windows in the last training step, with dropout. If the CPU had no
+    // windows, its loss is zero.
+    real last_gpu_loss() const {
+        return last_gpu_loss_;
+    }
+
+    real last_cpu_loss() const {
+        return last_cpu_loss_;
     }
 
     int cpu_threads() const {
@@ -520,6 +552,8 @@ private:
     StepTimes times_;
     int steps_ = 0;
     bool zeroed_ = false;
+    real last_gpu_loss_ = real(0);
+    real last_cpu_loss_ = real(0);
 
     // Kept between steps so that their allocated memory is reused.
     std::vector<std::vector<float>> gpu_grads_;
@@ -566,16 +600,20 @@ void print_config(const Config& cfg) {
     printf("  %d channels, %d heads, %d blocks, context %d, batch %d, dropout %.2f, "
         "lr %.0e\n", cfg.n_embd, cfg.n_head, cfg.n_layer, cfg.block, cfg.batch,
         static_cast<double>(cfg.dropout), static_cast<double>(cfg.lr));
+    const bool video_scale = cfg.score_scale == ScoreScale::kEmbed;
+    const bool video_init = cfg.init == Init::kTorchDefault;
+    printf("  attention scores times 1/sqrt(%d) (%s), %s (%s)\n", video_scale ? cfg.n_embd : cfg.n_embd / cfg.n_head,
+        video_scale ? "the video's code" : "the published gpt.py", video_init ? "PyTorch's default init" : "init N(0, 0.02)",
+        video_init ? "the video's code" : "the published gpt.py");
 }
 
-// Runs one forward and backward pass at the scale-up's width and context, on
-// the GPU/CPU split model and on the scalar reference. Both start from the
-// same weights and use the same batch, and every gradient tensor is compared.
-// Dropout is off, because the two models would draw different masks.
+// Runs one forward and backward pass at the scale-up's width and context, on the GPU/CPU split model and on the scalar reference.
+// Both start from the same weights and use the same batch, and every gradient tensor is compared. Dropout is off, because the two
+// models would draw different masks. The score scale and the init are the ones that section 2 trains with. So this also checks that
+// both sides scale the scores in the same way.
 void check_split(const Data& d) {
     std::cout << "\n== 1. the chunked split against the reference ==\n";
-    const Config cfg{ kBigEmbed, kBigHeads, kBigLayers, kBigBlock, kCheckBatch,
-        real(0), kBigLr };
+    const Config cfg{ kBigEmbed, kBigHeads, kBigLayers, kBigBlock, kCheckBatch, real(0), kBigLr, kScoreScale, kInit };
     print_config(cfg);
 
     std::mt19937 g(1337);
@@ -636,6 +674,96 @@ int evaluations_from(int it) {
     return n;
 }
 
+// Sums of the batch loss over a number of training steps: of the whole batch, of the GPU's windows and of the CPU's windows.
+struct LossSums {
+    double batch = 0.0;
+    double gpu = 0.0;
+    double cpu = 0.0;
+    int steps = 0;
+
+    void add(const SplitModel& model, real loss) {
+        batch += static_cast<double>(loss);
+        gpu += static_cast<double>(model.last_gpu_loss());
+        cpu += static_cast<double>(model.last_cpu_loss());
+        ++steps;
+    }
+};
+
+// One evaluation of the training curve.
+struct Evaluation {
+    int step;
+    double minutes;
+    Losses losses;
+};
+
+// A copy of the training curve in a CSV file. A run takes about three hours, and the console's scroll buffer does not keep all of
+// its output. The file is flushed after every row. So if the run is stopped, the file still holds every row up to that point. There
+// are two kinds of rows: a progress row every kProgressEvery steps, and an evaluation row for every evaluation. Each kind leaves the
+// other kind's columns empty. In both kinds, `step` is the number of training steps done.
+class CurveLog {
+public:
+    explicit CurveLog(const std::string& path) : f_(path) {
+        if (!f_) {
+            printf("  could not open %s, so the curve is only in this output\n", path.c_str());
+            return;
+        }
+        printf("  the training curve goes to %s\n", path.c_str());
+        f_ << "step,minutes,batch_loss,gpu_batch_loss,cpu_batch_loss,ms_per_step,gpu_windows,train_loss,val_loss\n";
+        f_.flush();
+    }
+
+    void progress(int step, double minutes, const LossSums& s, double ms_per_step, int gpu_windows) {
+        char buf[160];
+        std::snprintf(buf, sizeof(buf), "%d,%.2f,%.4f,%.4f,%.4f,%.0f,%d,,\n", step, minutes, s.batch / s.steps, s.gpu / s.steps,
+            s.cpu / s.steps, ms_per_step, gpu_windows);
+        write(buf);
+    }
+
+    void evaluation(const Evaluation& e) {
+        char buf[96];
+        std::snprintf(buf, sizeof(buf), "%d,%.2f,,,,,,%.4f,%.4f\n", e.step, e.minutes, static_cast<double>(e.losses.train),
+            static_cast<double>(e.losses.val));
+        write(buf);
+    }
+
+private:
+    void write(const char* row) {
+        if (f_) {
+            f_ << row;
+            f_.flush();
+        }
+    }
+
+    std::ofstream f_;
+};
+
+// The CSV file has the checkpoint's name with another extension. So each combination of settings has its own curve next to its own
+// checkpoint.
+std::string curve_path(const std::string& ckpt) {
+    const std::string ext = ".ckpt";
+    CHECK(ckpt.size() > ext.size() && ckpt.compare(ckpt.size() - ext.size(), ext.size(), ext) == 0,
+        "a checkpoint name without " << ext << ": " << ckpt);
+    return ckpt.substr(0, ckpt.size() - ext.size()) + ".csv";
+}
+
+// All evaluations at the end of the run, so that the end of the output shows the whole curve.
+void print_curve(const std::vector<Evaluation>& evals) {
+    printf("  the evaluations:\n");
+    printf("      step     train       val       gap\n");
+    const Evaluation* best = nullptr;
+    for (const Evaluation& e : evals) {
+        const double train = static_cast<double>(e.losses.train);
+        const double val = static_cast<double>(e.losses.val);
+        printf("    %6d  %8.4f  %8.4f  %+8.4f\n", e.step, train, val, val - train);
+        if (best == nullptr || e.losses.val < best->losses.val) {
+            best = &e;
+        }
+    }
+    if (best != nullptr) {
+        printf("  lowest validation loss %.4f, at step %d\n", static_cast<double>(best->losses.val), best->step);
+    }
+}
+
 // Python, the hyperparameters the video ends on:
 //   batch_size = 64
 //   block_size = 256
@@ -685,66 +813,73 @@ bool train_or_load(const Data& d, const Config& cfg, SplitModel& model,
     }
 
     printf("  no checkpoint beside the data, so %d steps of training\n", kIters);
+    CurveLog curve_log(curve_path(ckpt));
     std::vector<int> x, y;
-    Losses first{ real(0), real(0) };
-    Losses last{ real(0), real(0) };
+    std::vector<Evaluation> curve;
     double step_s = 0.0;
     double eval_s = 0.0;
-    int evals = 0;
     double recent_s = 0.0;
-    double recent_loss = 0.0;
+    LossSums recent;       // since the last progress line
+    LossSums since_eval;   // since the last evaluation
+    LossSums all;
     const Clock::time_point t0 = Clock::now();
     for (int it = 0; it < kIters; ++it) {
         if (evaluates_at(it)) {
             const Clock::time_point e0 = Clock::now();
-            last = estimate_loss(model, d, cfg.batch, cfg.block);
+            const Losses l = estimate_loss(model, d, cfg.batch, cfg.block);
             eval_s += seconds_since(e0);
-            ++evals;
-            if (it == 0) {
-                first = last;
+            curve.push_back(Evaluation{ it, seconds_since(t0) / 60.0, l });
+            curve_log.evaluation(curve.back());
+            printf("    step %d: train loss %.4f, val loss %.4f   (%.1f min in)\n", it, static_cast<double>(l.train),
+                static_cast<double>(l.val), curve.back().minutes);
+            if (since_eval.steps > 0) {
+                printf("      batch loss of the last %d steps: %.4f on the GPU's windows, %.4f on the CPU's\n", since_eval.steps,
+                    since_eval.gpu / since_eval.steps, since_eval.cpu / since_eval.steps);
+                since_eval = LossSums();
             }
-            printf("    step %d: train loss %.4f, val loss %.4f   (%.1f min in)\n",
-                it, static_cast<double>(last.train), static_cast<double>(last.val),
-                seconds_since(t0) / 60.0);
         }
 
         sample_batch(d.train, cfg.batch, cfg.block, x, y, g);
         const Clock::time_point s0 = Clock::now();
         model.zero_grad();
-        const real loss = model.forward_backward(x.data(), y.data(), cfg.batch,
-            cfg.block);
+        const real loss = model.forward_backward(x.data(), y.data(), cfg.batch, cfg.block);
         model.adamw_step();
         const double s = seconds_since(s0);
         step_s += s;
         recent_s += s;
-        recent_loss += static_cast<double>(loss);
+        recent.add(model, loss);
+        since_eval.add(model, loss);
+        all.add(model, loss);
 
         if ((it + 1) % kProgressEvery == 0) {
-            // The remaining steps at the average step time so far, plus the
-            // remaining evaluations at the average evaluation time.
-            const double left_s = (kIters - it - 1) * step_s / (it + 1)
-                + evaluations_from(it + 1) * eval_s / evals;
-            printf("      %d steps, batch loss %.4f, %.0f ms a step, %.0f GFLOP/s, "
-                "%d windows on the GPU, about %.0f min to go\n",
-                it + 1, recent_loss / kProgressEvery, 1e3 * recent_s / kProgressEvery,
-                flops * kProgressEvery / recent_s / 1e9, model.times().gpu_windows,
+            // The remaining steps at the average step time so far, plus the remaining evaluations at the average evaluation time.
+            const int evals = static_cast<int>(curve.size());
+            const double left_s = (kIters - it - 1) * step_s / (it + 1) + evaluations_from(it + 1) * eval_s / evals;
+            const double ms = 1e3 * recent_s / kProgressEvery;
+            printf("      %d steps, batch loss %.4f, %.0f ms a step, %.0f GFLOP/s, %d windows on the GPU, about %.0f min to go\n",
+                it + 1, recent.batch / recent.steps, ms, flops * kProgressEvery / recent_s / 1e9, model.times().gpu_windows,
                 left_s / 60.0);
+            curve_log.progress(it + 1, seconds_since(t0) / 60.0, recent, ms, model.times().gpu_windows);
             recent_s = 0.0;
-            recent_loss = 0.0;
+            recent = LossSums();
         }
     }
 
-    printf("  %d steps in %.1f min: %.0f ms a step, %.0f GFLOP/s\n", kIters,
-        step_s / 60.0, 1e3 * step_s / kIters, flops * kIters / step_s / 1e9);
-    printf("  %d evaluations of %d batches on each split took another %.1f min\n",
-        evals, kEvalIters, eval_s / 60.0);
+    printf("  %d steps in %.1f min: %.0f ms a step, %.0f GFLOP/s\n", kIters, step_s / 60.0, 1e3 * step_s / kIters,
+        flops * kIters / step_s / 1e9);
+    printf("  %d evaluations of %d batches on each split took another %.1f min\n", static_cast<int>(curve.size()), kEvalIters,
+        eval_s / 60.0);
     if (save_params(model.params(), cfg, d, ckpt)) {
         printf("  saved to %s - delete it to train again\n", ckpt.c_str());
     }
+    print_curve(curve);
+    const double gpu_mean = all.gpu / all.steps;
+    const double cpu_mean = all.cpu / all.steps;
+    printf("  batch loss of all %d steps: %.4f on the GPU's windows, %.4f on the CPU's\n", all.steps, gpu_mean, cpu_mean);
 
-    chk.close("loss before training", first.val,
-        std::log(static_cast<double>(d.vocab)), kStartTolerance);
-    chk.close("validation loss", last.val, kVideoVal, kVideoValTolerance);
+    chk.close("loss before training", curve.front().losses.val, std::log(static_cast<double>(d.vocab)), kStartTolerance);
+    chk.close("validation loss", curve.back().losses.val, kVideoVal, kVideoValTolerance);
+    chk.close("the GPU's batch loss against the CPU's", gpu_mean, cpu_mean, kSidesTolerance);
     chk.report();
     return true;
 }
@@ -809,10 +944,8 @@ int main() {
 
         check_split(d);
 
-        // Seeded in the same way as gpt.cpp's scale-up, so both programs start
-        // from the same weights.
-        const Config cfg{ kBigEmbed, kBigHeads, kBigLayers, kBigBlock, kBigBatch,
-            kBigDropout, kBigLr };
+        // Seeded in the same way as gpt.cpp's scale-up. With the default init, both programs start from the same weights.
+        const Config cfg{ kBigEmbed, kBigHeads, kBigLayers, kBigBlock, kBigBatch, kBigDropout, kBigLr, kScoreScale, kInit };
         std::mt19937 g(1337);
         SplitModel model(cfg, d.vocab, kGpuChunk, g);
         const bool trained = train_or_load(d, cfg, model, g);

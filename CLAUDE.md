@@ -39,8 +39,12 @@ there for the walkthrough executable.
   each batch, with the GPU's share run in equal chunks so it fits the 1050 Ti's
   4 GB. A project of its own: `check.h`, `gpt_gemm.h`, `gpt_model.h`,
   `gpt_cuda.h` and `gpt_cuda.cu` there are copies of the `makemore/` files
-  (a note added at the top, otherwise unchanged), and nothing in it includes
-  `makemore/`. It reads `makemore/input.txt` and saves its checkpoint there.
+  (a note added at the top), and nothing in it includes `makemore/`. The
+  copies differ in one way: they can also run the code the video ran
+  (`Config::score_scale` and `Config::init`; checkpoint format version 4 when
+  the score scale is not the default). With the defaults they compute the same
+  model. It reads `makemore/input.txt` and saves its checkpoint there, plus a
+  CSV of the training curve under the same name.
 
 ## Targets
 
@@ -106,6 +110,9 @@ for (int i = 0; i < n; ++i) { sum += x[i]; }
 ```
 
 - 4-space indent, no tabs.
+- Lines up to 140 characters, comments included. Wrap code and comment prose
+  at 140, not at 80. Older code wraps near 80; leave it as it is unless the
+  change touches it.
 - ASCII only, comments included.
 - Comments explain *why*, in prose sentences, at the density of the surrounding
   file. No narration of lines that speak for themselves.

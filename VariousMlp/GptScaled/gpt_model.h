@@ -1,9 +1,9 @@
-// GptScaled's own copy of makemore/gpt_model.h, copied at commit 512eaaa.
-// Later changes went into both copies, so a diff between the two shows only
-// this note. gpt_scaled compiles only the files in this directory, which keeps
-// it independent of makemore/: a change to one copy does not reach the other.
-// Where the comments below mention other files, they mean the files in
-// makemore/.
+// GptScaled's own copy of makemore/gpt_model.h, copied at commit 512eaaa. Later changes went into both copies, with one exception.
+// This copy can also run the code that the video ran, which differs from the published gpt.py in two places. So Config has two more
+// settings, score_scale and init, and checkpoint format version 4 records the score scale. makemore/'s copy has neither. With the
+// default settings, the two copies compute the same model and write the same files. gpt_scaled compiles only the files in this
+// directory, which keeps it independent of makemore/: a change to one copy does not reach the other. Where the comments below mention
+// other files, they mean the files in makemore/.
 //
 // gpt_model.h - the Transformer itself, shared by every file that uses it.
 //
@@ -451,19 +451,31 @@ protected:
     Matrix dx_;
 };
 
+// How the weights start. The code that the video runs and the published gpt.py differ here.
+//
+// The code in the video has no initialisation of its own. So every layer gets PyTorch's default. nn.Linear draws its weight and its
+// bias uniformly from [-1/sqrt(fan_in), 1/sqrt(fan_in)]. nn.Embedding draws from a normal distribution with standard deviation 1.
+// Three weeks after the video, gpt.py gained _init_weights. Its commit message says that the video did not cover it. That function
+// draws every Linear and Embedding weight from a normal distribution with standard deviation 0.02, and sets every bias to zero. The
+// video's validation loss of 1.48 comes from the code without it.
+enum class Init {
+    kNormal,          // _init_weights in the published gpt.py
+    kTorchDefault,    // PyTorch's defaults, as in the code the video runs
+};
+
+constexpr real kInitStd = real(0.02);
+
 // Python:
 //   nn.Linear(fan_in, fan_out, bias=...)
 //   torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 //   torch.nn.init.zeros_(module.bias)
 //
-// The video's _init_weights, which it adds late and without much explanation:
-// a standard deviation of 0.02 everywhere, instead of the Kaiming
-// 1/sqrt(fan_in) from the previous video. For n_embd=384 those are 0.02 and
-// 0.051. So it follows the same idea, "start each layer with smaller weights
-// than seems necessary", but with one number for the whole model.
+// Init::kNormal is the published gpt.py's _init_weights: a standard deviation of 0.02 everywhere, instead of the Kaiming
+// 1/sqrt(fan_in) from the previous video. For n_embd=384 those are 0.02 and 0.051. So it follows the same idea, "start each layer
+// with smaller weights than seems necessary", but with one number for the whole model.
 class Linear : public Layer {
 public:
-    Linear(int fan_in, int fan_out, bool has_bias, real init_std, std::mt19937& g)
+    Linear(int fan_in, int fan_out, bool has_bias, Init init, std::mt19937& g)
         : fan_in_(fan_in), fan_out_(fan_out), has_bias_(has_bias),
         w_(static_cast<size_t>(fan_in) * static_cast<size_t>(fan_out)),
         dw_(w_.size(), real(0)),
@@ -473,9 +485,24 @@ public:
         CHECK(fan_in > 0 && fan_out > 0,
             "a " << fan_in << "x" << fan_out << " linear layer");
 
-        std::normal_distribution<real> randn(real(0), init_std);
-        for (real& v : w_) {
-            v = randn(g);
+        if (init == Init::kTorchDefault) {
+            // nn.Linear.reset_parameters: kaiming_uniform_ with a=sqrt(5) for the weight, which gives a bound of exactly
+            // 1/sqrt(fan_in), and the same bound for the bias. torch stores the weight transposed, but every entry is drawn
+            // independently, so the layout does not matter.
+            const real bound = real(1) / std::sqrt(static_cast<real>(fan_in));
+            std::uniform_real_distribution<real> u(-bound, bound);
+            for (real& v : w_) {
+                v = u(g);
+            }
+            for (real& v : b_) {
+                v = u(g);
+            }
+        }
+        else {
+            std::normal_distribution<real> randn(real(0), kInitStd);
+            for (real& v : w_) {
+                v = randn(g);
+            }
         }
         wname_ = "W " + std::to_string(fan_in) + "x" + std::to_string(fan_out);
         bname_ = "b " + std::to_string(fan_out);
@@ -864,6 +891,22 @@ private:
 // Self-attention
 // ---------------------------------------------------------------------------
 
+// The scale factor for attention's scores before the softmax. The code that the video runs and the published gpt.py differ here
+// too. The video's Head.forward multiplies by C**-0.5, and C comes from x.shape, so it is n_embd: 384 at the scale-up. Eight days
+// after the video, gpt.py was changed to k.shape[-1]**-0.5, the head size: 64 at the scale-up. With n_embd, the scores are
+// sqrt(n_head) times smaller. So the softmax starts flatter, and the query and key weights have to grow larger before it becomes
+// sharp.
+enum class ScoreScale {
+    kHeadSize = 0,    // k.shape[-1]**-0.5, the published gpt.py
+    kEmbed = 1,       // C**-0.5, the code the video runs
+};
+
+// The factor itself. The CPU and the GPU model both get it from here, so they multiply by the same float.
+inline real score_scale_factor(ScoreScale s, int n_embd, int head_size) {
+    const int dim = s == ScoreScale::kEmbed ? n_embd : head_size;
+    return real(1) / std::sqrt(static_cast<real>(dim));
+}
+
 // Python:
 //   class Head(nn.Module):
 //       def forward(self, x):
@@ -871,6 +914,7 @@ private:
 //           k = self.key(x)       # (B, T, hs)
 //           q = self.query(x)     # (B, T, hs)
 //           wei = q @ k.transpose(-2, -1) * k.shape[-1]**-0.5   # (B, T, T)
+//           # in the video: wei = q @ k.transpose(-2, -1) * C**-0.5
 //           wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
 //           wei = F.softmax(wei, dim=-1)
 //           wei = self.dropout(wei)
@@ -898,17 +942,18 @@ private:
 //     reach the softmax. Without it, a wide head produces large dot products,
 //     the softmax output becomes almost one-hot, and the gradient through it
 //     goes to zero. The previous video found the same problem with tanh.
+//     The code that the video runs uses 1/sqrt(n_embd) instead, which ScoreScale::kEmbed reproduces.
 //   - the masked entries are stored as zero probability, not as -inf, so the
 //     backward pass can loop over u <= t and ignore the rest.
 class CausalSelfAttention : public Layer {
 public:
-    CausalSelfAttention(int n_embd, int n_head, real dropout, real init_std,
-        std::mt19937& g)
+    CausalSelfAttention(int n_embd, int n_head, real dropout, ScoreScale score_scale, Init init, std::mt19937& g)
         : n_embd_(n_embd), n_head_(n_head), hs_(n_embd / n_head),
-        key_(n_embd, n_embd, false, init_std, g),
-        query_(n_embd, n_embd, false, init_std, g),
-        value_(n_embd, n_embd, false, init_std, g),
-        proj_(n_embd, n_embd, true, init_std, g),
+        scale_(score_scale_factor(score_scale, n_embd, n_embd / n_head)),
+        key_(n_embd, n_embd, false, init, g),
+        query_(n_embd, n_embd, false, init, g),
+        value_(n_embd, n_embd, false, init, g),
+        proj_(n_embd, n_embd, true, init, g),
         attn_drop_(dropout, g),
         resid_drop_(dropout, g)
     {
@@ -929,7 +974,7 @@ public:
 
         const int B = x.batch;
         const int T = x.time;
-        const real scale = real(1) / std::sqrt(static_cast<real>(hs_));
+        const real scale = scale_;
 
         const Matrix& q = query_.forward(x);
         const Matrix& k = key_.forward(x);
@@ -1044,7 +1089,7 @@ public:
 
         const int B = dheads.batch;
         const int T = dheads.time;
-        const real scale = real(1) / std::sqrt(static_cast<real>(hs_));
+        const real scale = scale_;
 
         const Matrix& a = attn_drop_.out();
         const Matrix& q = query_.out();
@@ -1206,6 +1251,7 @@ private:
     int n_embd_;
     int n_head_;
     int hs_;
+    real scale_;
     Linear key_, query_, value_, proj_;
     Dropout attn_drop_, resid_drop_;
     Matrix att_, heads_;
@@ -1229,9 +1275,9 @@ private:
 // comes from the original paper.
 class FeedForward : public Layer {
 public:
-    FeedForward(int n_embd, real dropout, real init_std, std::mt19937& g)
-        : fc_(n_embd, 4 * n_embd, true, init_std, g),
-        proj_(4 * n_embd, n_embd, true, init_std, g),
+    FeedForward(int n_embd, real dropout, Init init, std::mt19937& g)
+        : fc_(n_embd, 4 * n_embd, true, init, g),
+        proj_(4 * n_embd, n_embd, true, init, g),
         drop_(dropout, g)
     {
     }
@@ -1279,9 +1325,8 @@ private:
 // any normalisation.
 class Block : public Layer {
 public:
-    Block(int n_embd, int n_head, real dropout, real init_std, std::mt19937& g)
-        : ln1_(n_embd), attn_(n_embd, n_head, dropout, init_std, g),
-        ln2_(n_embd), ffwd_(n_embd, dropout, init_std, g)
+    Block(int n_embd, int n_head, real dropout, ScoreScale score_scale, Init init, std::mt19937& g)
+        : ln1_(n_embd), attn_(n_embd, n_head, dropout, score_scale, init, g), ln2_(n_embd), ffwd_(n_embd, dropout, init, g)
     {
     }
 
@@ -1364,8 +1409,6 @@ private:
 // The models
 // ---------------------------------------------------------------------------
 
-constexpr real kInitStd = real(0.02);
-
 // Cross entropy over B*T independent predictions. It is the same as in the
 // makemore files, except that the vocabulary size is known only at run time.
 //
@@ -1424,6 +1467,11 @@ struct Config {
     int batch;
     real dropout;
     real lr;
+
+    // The two places where the code that the video runs differs from the published gpt.py. The defaults follow the published
+    // gpt.py, which makemore/'s copy of this file always does.
+    ScoreScale score_scale = ScoreScale::kHeadSize;
+    Init init = Init::kNormal;
 };
 
 // The approximate number of floating point operations in one training step.
@@ -1477,13 +1525,15 @@ public:
         wpe_(static_cast<size_t>(cfg.block) * cfg.n_embd),
         dwpe_(wpe_.size(), real(0)),
         ln_f_(cfg.n_embd),
-        lm_head_(cfg.n_embd, vocab, true, kInitStd, g)
+        lm_head_(cfg.n_embd, vocab, true, cfg.init, g)
     {
         CHECK(cfg.n_layer >= 0, "a network of " << cfg.n_layer << " blocks");
         CHECK(cfg.block > 0 && cfg.batch > 0,
             "batch " << cfg.batch << " of " << cfg.block << " positions");
 
-        std::normal_distribution<real> randn(real(0), kInitStd);
+        // nn.Embedding's default is a standard deviation of 1.
+        const real emb_std = cfg.init == Init::kTorchDefault ? real(1) : kInitStd;
+        std::normal_distribution<real> randn(real(0), emb_std);
         for (real& v : wte_) {
             v = randn(g);
         }
@@ -1493,7 +1543,7 @@ public:
 
         for (int i = 0; i < cfg.n_layer; ++i) {
             blocks_.push_back(std::make_unique<Block>(cfg.n_embd, cfg.n_head,
-                cfg.dropout, kInitStd, g));
+                cfg.dropout, cfg.score_scale, cfg.init, g));
         }
 
         params_.push_back({ "wte " + std::to_string(vocab) + "x"
@@ -1781,9 +1831,15 @@ private:
 // sizeof(real) in the header and in the file name stops a float build from
 // reading a double build's file.
 
-// The last byte is the version of the format. Version 3 added the vocabulary
-// to the header.
+// The last byte is the version of the format. Version 3 added the vocabulary to the header.
+//
+// Version 4 adds the attention score scale after the model's shape. The same weights give a different model with a different scale.
+// makemore/'s copy of this file reads only version 3. So a model with the default scale is still written as version 3, and that copy
+// can open it. Only a model with the video's scale is written as version 4. makemore/'s copy rejects that file, so it never runs
+// those weights with the wrong scale.
 constexpr char kCheckpointMagic[8] = { 'V', 'M', 'L', 'P', 'G', 'P', 'T', '3' };
+constexpr size_t kVersionByte = sizeof(kCheckpointMagic) - 1;
+constexpr char kVersionWithScale = '4';
 
 // FNV-1a over the vocabulary and the corpus length. The header already checks
 // the shape of the model, but the same shape does not mean the same corpus.
@@ -1818,12 +1874,15 @@ inline bool read_pod(std::istream& f, T& v) {
     return static_cast<bool>(f.read(reinterpret_cast<char*>(&v), sizeof(T)));
 }
 
+// With the default settings, the name is the one that makemore/'s copy uses. Each of the video's settings adds a tag. So a run with
+// other settings trains its own model. It does not load a checkpoint that was trained with different settings, and it does not
+// overwrite one. The init does not change what the weights mean, but it does change how they were trained, so it is in the name too.
 inline std::string checkpoint_name(const Config& cfg, const Data& d) {
-    char buf[160];
-    std::snprintf(buf, sizeof(buf), "gpt_c%d_h%d_l%d_t%d_v%d_r%d_%08x.ckpt",
-        cfg.n_embd, cfg.n_head, cfg.n_layer, cfg.block, d.vocab,
-        static_cast<int>(sizeof(real)),
-        static_cast<unsigned>(corpus_fingerprint(d) & 0xffffffffu));
+    const char* scale = cfg.score_scale == ScoreScale::kEmbed ? "_scale-embd" : "";
+    const char* init = cfg.init == Init::kTorchDefault ? "_init-torch" : "";
+    char buf[192];
+    std::snprintf(buf, sizeof(buf), "gpt_c%d_h%d_l%d_t%d_v%d_r%d_%08x%s%s.ckpt", cfg.n_embd, cfg.n_head, cfg.n_layer, cfg.block,
+        d.vocab, static_cast<int>(sizeof(real)), static_cast<unsigned>(corpus_fingerprint(d) & 0xffffffffu), scale, init);
     return std::string(buf);
 }
 
@@ -1835,7 +1894,13 @@ inline bool save_params(const std::vector<Param>& params, const Config& cfg,
         return false;
     }
 
-    f.write(kCheckpointMagic, sizeof(kCheckpointMagic));
+    const bool with_scale = cfg.score_scale != ScoreScale::kHeadSize;
+    char magic[sizeof(kCheckpointMagic)];
+    std::memcpy(magic, kCheckpointMagic, sizeof(magic));
+    if (with_scale) {
+        magic[kVersionByte] = kVersionWithScale;
+    }
+    f.write(magic, sizeof(magic));
     write_pod(f, static_cast<std::int32_t>(sizeof(real)));
     write_pod(f, corpus_fingerprint(d));
     write_pod(f, static_cast<std::int32_t>(d.vocab));
@@ -1844,6 +1909,9 @@ inline bool save_params(const std::vector<Param>& params, const Config& cfg,
     write_pod(f, static_cast<std::int32_t>(cfg.n_head));
     write_pod(f, static_cast<std::int32_t>(cfg.n_layer));
     write_pod(f, static_cast<std::int32_t>(cfg.block));
+    if (with_scale) {
+        write_pod(f, static_cast<std::int32_t>(cfg.score_scale));
+    }
     write_pod(f, static_cast<std::int32_t>(params.size()));
 
     for (const Param& p : params) {
@@ -1856,10 +1924,9 @@ inline bool save_params(const std::vector<Param>& params, const Config& cfg,
     return static_cast<bool>(f);
 }
 
-// What the header of a checkpoint holds. Only the four fields of Config that
-// change the shape of the weights are stored. Batch, dropout and the learning
-// rate are training settings. So a model built from the header gets the
-// values for sampling: batch 1, no dropout.
+// What the header of a checkpoint holds. Of the fields of Config, it stores the four that change the shape of the weights, and the
+// score scale, which changes what the weights mean. Batch, dropout, the learning rate and the init are training settings. So a model
+// built from the header gets the values for sampling: batch 1, no dropout.
 struct CheckpointHeader {
     Config cfg{ 0, 0, 0, 0, 1, real(0), real(0) };
     Vocab vocab;
@@ -1872,13 +1939,13 @@ struct CheckpointHeader {
 // returned instead of printed, because gpt_chat.cpp shows it in its list of
 // checkpoints.
 inline const char* read_checkpoint_header(std::istream& f, CheckpointHeader& h) {
-    constexpr size_t kVersionByte = sizeof(kCheckpointMagic) - 1;
     char magic[sizeof(kCheckpointMagic)];
     if (!f.read(magic, sizeof(magic))
         || std::memcmp(magic, kCheckpointMagic, kVersionByte) != 0) {
         return "not a checkpoint written by this file";
     }
-    if (magic[kVersionByte] != kCheckpointMagic[kVersionByte]) {
+    const char version = magic[kVersionByte];
+    if (version != kCheckpointMagic[kVersionByte] && version != kVersionWithScale) {
         return "it is in another version of the format";
     }
 
@@ -1905,8 +1972,15 @@ inline const char* read_checkpoint_header(std::istream& f, CheckpointHeader& h) 
     h.vocab.assign(chars);
 
     std::int32_t embd = 0, head = 0, layer = 0, block = 0;
-    if (!read_pod(f, embd) || !read_pod(f, head) || !read_pod(f, layer)
-        || !read_pod(f, block) || !read_pod(f, h.tensors)) {
+    if (!read_pod(f, embd) || !read_pod(f, head) || !read_pod(f, layer) || !read_pod(f, block)) {
+        return "the header is truncated";
+    }
+    // A version 3 file has no score scale, because it always used the default.
+    std::int32_t scale = static_cast<std::int32_t>(ScoreScale::kHeadSize);
+    if (version == kVersionWithScale && !read_pod(f, scale)) {
+        return "the header is truncated";
+    }
+    if (!read_pod(f, h.tensors)) {
         return "the header is truncated";
     }
     // gpt_chat.cpp builds a model from these values. A shape that no model
@@ -1915,10 +1989,14 @@ inline const char* read_checkpoint_header(std::istream& f, CheckpointHeader& h) 
     if (embd <= 0 || head <= 0 || embd % head != 0 || layer < 0 || block <= 0) {
         return "its model shape is malformed";
     }
+    if (scale != static_cast<std::int32_t>(ScoreScale::kHeadSize) && scale != static_cast<std::int32_t>(ScoreScale::kEmbed)) {
+        return "its attention score scale is malformed";
+    }
     h.cfg.n_embd = embd;
     h.cfg.n_head = head;
     h.cfg.n_layer = layer;
     h.cfg.block = block;
+    h.cfg.score_scale = static_cast<ScoreScale>(scale);
     return nullptr;
 }
 
@@ -1991,6 +2069,9 @@ inline bool load_params(std::vector<Param>& params, const Config& cfg, const Dat
         || h.cfg.n_head != cfg.n_head || h.cfg.n_layer != cfg.n_layer
         || h.cfg.block != cfg.block) {
         return reject("it was written for a differently shaped model");
+    }
+    if (h.cfg.score_scale != cfg.score_scale) {
+        return reject("it was trained with a different attention score scale");
     }
     if (const char* why = read_tensors(f, h.tensors, params)) {
         return reject(why);

@@ -1,9 +1,7 @@
-// GptScaled's own copy of makemore/gpt_cuda.h, copied at commit 512eaaa.
-// Later changes went into both copies, so a diff between the two shows only
-// this note. gpt_scaled compiles only the files in this directory, which keeps
-// it independent of makemore/: a change to one copy does not reach the other.
-// Where the comments below mention other files, they mean the files in
-// makemore/.
+// GptScaled's own copy of makemore/gpt_cuda.h, copied at commit 512eaaa. Later changes went into both copies, except for
+// score_scale in Shape. That field exists only here, because only this directory's gpt_model.h can run the attention scale of the
+// code that the video runs. gpt_scaled compiles only the files in this directory, which keeps it independent of makemore/: a change
+// to one copy does not reach the other. Where the comments below mention other files, they mean the files in makemore/.
 //
 // gpt_cuda.h - the host side of the model in gpt_cuda.cu.
 //
@@ -27,10 +25,12 @@
 
 namespace gpt_cuda {
 
-// The parts of gpt::Config that define the shape of the weights, plus the
-// vocabulary size and the dropout rate. The batch size is not here: every call
-// passes its own batch size, and the activation buffers grow to fit the
-// largest batch so far.
+// The parts of gpt::Config that define the shape of the weights, plus the vocabulary size, the dropout rate and the scale factor
+// for attention's scores. The batch size is not here: every call passes its own batch size, and the activation buffers grow to fit
+// the largest batch so far.
+//
+// The scale factor is the number itself, not gpt::ScoreScale, because this file does not include gpt_model.h. Get it from
+// gpt::score_scale_factor, so that both models multiply by the same float.
 struct Shape {
     int n_embd;
     int n_head;
@@ -38,6 +38,7 @@ struct Shape {
     int block;
     int vocab;
     float dropout;
+    float score_scale;
 };
 
 class Model {
